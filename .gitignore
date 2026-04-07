@@ -6,8 +6,11 @@ files/
 my_rfp_vectordb/
 *.zip
 *.csv
+data_list.csv
 *.xlsx
 *.json
 *.png
 *.txt
 apiconn.py
+.uv-cache/
+.hf-cache/

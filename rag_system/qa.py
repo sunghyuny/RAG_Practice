@@ -2,13 +2,14 @@ import argparse
 from typing import List, Optional
 
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from rag_system.config import SETTINGS, require_env
-from rag_system.rag_utils import TAG_KEYWORDS, build_embeddings
+from rag_system.rag_utils import build_embeddings, score_tags
 
 
 class SearchPlan(BaseModel):
@@ -22,10 +23,10 @@ ANSWER_PROMPT = ChatPromptTemplate.from_template(
 아래 검색 결과만 근거로 답변하세요.
 
 규칙:
-1. 문서에 없는 내용은 추측하지 말고 "문서에서 확인되지 않았습니다"라고 답하세요.
-2. 여러 사업이 섞여 있으면 사업명을 구분해서 답하세요.
-3. 예산, 기관명, 제출 방식, 마감일, 요구사항 번호가 보이면 그대로 인용해 요약하세요.
-4. 답변 마지막에 근거 문서 제목 목록을 짧게 덧붙이세요.
+1. 문서에 없는 내용은 추측하지 말고 "문서에서 확인되지 않습니다."라고 답하세요.
+2. 여러 사업이 섞여 있으면 사업명을 구분해서 설명하세요.
+3. 예산, 제출 방식, 마감일, 요구사항 번호가 보이면 그대로 인용하거나 요약하세요.
+4. 답변 마지막에 근거가 된 문서 제목 목록을 짧게 적으세요.
 
 [검색 문서]
 {context}
@@ -71,15 +72,82 @@ def build_models():
 
 
 def infer_query_tags(query: str) -> List[str]:
-    matched = []
-    lowered = query.lower()
-    for tag, keywords in TAG_KEYWORDS.items():
-        if any(keyword.lower() in lowered for keyword in keywords):
-            matched.append(tag)
-    return matched
+    scored_tags = score_tags(text=query)
+    return sorted(scored_tags, key=lambda tag: (-scored_tags[tag]["score"], tag))
 
 
-def retrieve_documents(user_query: str, vectorstore: Chroma, planner, all_titles: List[str], k: int):
+def build_tag_filter(query_tags: List[str]):
+    clauses = [{f"has_{tag}": True} for tag in query_tags]
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$or": clauses}
+
+
+def combine_filters(*filters):
+    available = [item for item in filters if item]
+    if not available:
+        return None
+    if len(available) == 1:
+        return available[0]
+    return {"$and": available}
+
+
+def unique_documents(doc_lists: List[List[Document]], limit: int) -> List[Document]:
+    merged: List[Document] = []
+    seen = set()
+    max_len = max((len(docs) for docs in doc_lists), default=0)
+
+    for index in range(max_len):
+        for docs in doc_lists:
+            if index >= len(docs):
+                continue
+            doc = docs[index]
+            key = (
+                doc.metadata.get("title"),
+                doc.metadata.get("chunk_id"),
+                doc.metadata.get("source"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(doc)
+            if len(merged) >= limit:
+                return merged
+
+    return merged
+
+
+def run_search(vectorstore: Chroma, query: str, k: int, retrieval_mode: str = "baseline", search_filter=None) -> List[Document]:
+    if retrieval_mode == "baseline":
+        if search_filter:
+            return vectorstore.similarity_search(query=query, k=k, filter=search_filter)
+        return vectorstore.similarity_search(query=query, k=k)
+
+    fetch_k = max(k * 4, 20)
+    if search_filter:
+        return vectorstore.max_marginal_relevance_search(
+            query=query,
+            k=k,
+            fetch_k=fetch_k,
+            filter=search_filter,
+        )
+    return vectorstore.max_marginal_relevance_search(
+        query=query,
+        k=k,
+        fetch_k=fetch_k,
+    )
+
+
+def retrieve_documents(
+    user_query: str,
+    vectorstore: Chroma,
+    planner,
+    all_titles: List[str],
+    k: int,
+    retrieval_mode: str = "baseline",
+):
     search_query = user_query
     agency = None
     project_name = None
@@ -94,39 +162,17 @@ def retrieve_documents(user_query: str, vectorstore: Chroma, planner, all_titles
 
     matched_titles = fuzzy_filter_titles(all_titles, agency, project_name)
     query_tags = infer_query_tags(user_query)
+    title_filter = {"title": {"$in": matched_titles}} if matched_titles else None
+    tag_filter = build_tag_filter(query_tags)
 
-    filters = []
-    if matched_titles:
-        filters.append({"title": {"$in": matched_titles}})
-    if query_tags:
-        filters.append({"primary_tag": {"$in": query_tags}})
+    search_results = [
+        run_search(vectorstore, search_query, k, retrieval_mode, combine_filters(title_filter, tag_filter)),
+        run_search(vectorstore, search_query, k, retrieval_mode, tag_filter),
+        run_search(vectorstore, search_query, k, retrieval_mode, title_filter),
+        run_search(vectorstore, search_query, k, retrieval_mode),
+    ]
 
-    if len(filters) == 2:
-        docs = vectorstore.similarity_search(
-            query=search_query,
-            k=k,
-            filter={"$and": filters},
-        )
-        if docs:
-            return docs
-
-    if query_tags:
-        docs = vectorstore.similarity_search(
-            query=search_query,
-            k=k,
-            filter={"primary_tag": {"$in": query_tags}},
-        )
-        if docs:
-            return docs
-
-    if matched_titles:
-        return vectorstore.similarity_search(
-            query=search_query,
-            k=k,
-            filter={"title": {"$in": matched_titles}},
-        )
-
-    return vectorstore.similarity_search(query=search_query, k=k)
+    return unique_documents(search_results, limit=k)
 
 
 def format_docs(docs) -> str:
@@ -138,11 +184,11 @@ def format_docs(docs) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
-def answer_query(question: str, k: int = SETTINGS.retrieval_k) -> dict:
+def answer_query(question: str, k: int = SETTINGS.retrieval_k, retrieval_mode: str = "baseline") -> dict:
     vectorstore = load_vectorstore()
     all_titles = load_titles(vectorstore)
     answer_llm, planner = build_models()
-    docs = retrieve_documents(question, vectorstore, planner, all_titles, k)
+    docs = retrieve_documents(question, vectorstore, planner, all_titles, k, retrieval_mode=retrieval_mode)
     chain = ANSWER_PROMPT | answer_llm | StrOutputParser()
     answer = chain.invoke({"context": format_docs(docs), "question": question})
     return {"question": question, "answer": answer, "documents": docs}
@@ -152,9 +198,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Ask a question about the indexed RFP corpus.")
     parser.add_argument("query", help="Question to ask")
     parser.add_argument("--k", type=int, default=SETTINGS.retrieval_k, help="Number of chunks to retrieve")
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=["baseline", "mmr"],
+        default="baseline",
+        help="Retrieval strategy to use",
+    )
     args = parser.parse_args()
 
-    result = answer_query(args.query, k=args.k)
+    result = answer_query(args.query, k=args.k, retrieval_mode=args.retrieval_mode)
     print(result["answer"])
 
     print("\n[Retrieved documents]")

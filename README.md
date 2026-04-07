@@ -1,21 +1,8 @@
-# RFP RAG Prototype
+# 중급프로젝트
 
-Minimal RAG project for Korean RFP documents.
-
-Included files:
-- `rag_system/`: ingestion, retrieval, QA, and evaluation modules
-- `pipeline.py`: ingestion entrypoint
-- `test.py`: evaluation entrypoint
-
-Notes:
-- Source documents in `files/` are ignored by git.
-- Vector DB in `my_rfp_vectordb/` is ignored by git.
-- Secrets must stay in a local `.env` file and must not be committed.
-
-Basic usage:
-
-```bash
-python -m rag_system.ingest --rebuild
-python -m rag_system.qa "질문"
-python test.py
-```
+- 지금까지 학습하신 자연어처리 및 LLM 지식들을 토대로, **RAG 시스템을 구축하여 복잡한 형태의 기업 및 정부 제안요청서(RFP) 내용을 효과적으로 추출하고 요약하여 필요한 정보를 제공**하는 서비스를 만들어봅시다.
+- 여러분들을 **B2G 입찰지원 전문 컨설팅 스타트업 - '입찰메이트'**의 엔지니어링 팀이라고 가정해 볼게요.
+  - '입찰메이트'는 공공입찰 컨설팅 서비스를 제공하는 스타트업입니다.
+  - 하루 수백건의 RFP(제안요청서)가 나라장터 등에서 올라오게 되는데, 한 요청서당 수십 페이지가 넘는 걸 기업 담당자들이 일일이 다 읽어볼 순 없겠죠. '입찰메이트'는 쏟아져나오는 요청서 가운데서 고객사에게 딱 알맞는 입찰 기회를 빠르게 찾아 고객사에게 추천하는 비즈니스를 하고 있습니다. 따라서 '입찰메이트'의 컨설턴트들은 **RFP의 주요 요구 조건, 대상 기관, 예산, 제출 방식 등** 중요한 정보를 핵심만 빠르게 파악한 뒤, 고객사들에게 추천하여 컨설팅까지 이어질 수 있는 기회를 만들어야합니다.
+  - '입찰메이트'의 엔지니어링 팀은 **사용자의 요청에 따라 RFP 문서의 내용을 효과적으로 추출하고 요약하여 필요한 정보를 제공할 수 있는 사내 RAG 시스템을 구현**하는 미션을 부여 받았습니다. 그렇게 되면 '입찰메이트'의 컨설턴트들이 수십 페이지가 넘어가는 제안서를 일일이 들여다볼 일은 없어지고, 컨설팅 업무에 최대한 집중할 수 있겠네요.
+- 여러분들은 100개의 실제 RFP 문서와 각각의 메타데이터를 제공받을 예정입니다. 다양한 자연어 처리 모델들로 실험하여 해당 문서들의 내용을 바탕으로 Q&A를 할 수 있는 시스템을 구축해보세요. 그리고 평가 방식이나 지표를 팀 별로 직접 선정하여 성능을 평가해보세요. 여러가지 의사 결정 과정이 모두 보고서와 발표에 드러나야 합니다.

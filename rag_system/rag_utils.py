@@ -5,8 +5,15 @@ import zlib
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-import olefile
-import pymupdf4llm
+try:
+    import olefile
+except ImportError:  # pragma: no cover
+    olefile = None
+
+try:
+    import pymupdf4llm
+except ImportError:  # pragma: no cover
+    pymupdf4llm = None
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,22 +24,54 @@ from rag_system.config import SETTINGS
 warnings.filterwarnings("ignore")
 
 SECTION_PATTERNS = [
-    re.compile(r"^\s*제\s*\d+\s*(장|절|조)\b.*$"),
+    re.compile(r"^\s*제?\s*\d+\s*장\b.*$"),
     re.compile(r"^\s*\d+(\.\d+){0,3}[\.\)]\s+.+$"),
-    re.compile(r"^\s*[가-하][\.\)]\s+.+$"),
+    re.compile(r"^\s*[가-힣][\.\)]\s+.+$"),
     re.compile(r"^\s*[A-Z][\.\)]\s+.+$"),
-    re.compile(r"^\s*(사업개요|사업 목적|추진 배경|추진 목적|제안 요청 내용|제안요청내용|제안 범위|과업 내용|과업내용|제출 서류|입찰 참가 자격|평가 기준|평가기준|사업 예산|예산|추진 일정|일정)\s*$"),
+    re.compile(
+        r"^\s*(사업개요|사업 목적|추진 배경|추진 목적|제안 요청 내용|제안요청내용|제안 범위|과업 내용|과업내용|제출 서류|입찰 참가 자격|평가 기준|평가기준|사업 예산|예산|추진 일정|일정)\s*$"
+    ),
 ]
 
-TAG_KEYWORDS = {
-    "budget": ["예산", "사업비", "총액", "금액", "추정가격", "기초금액", "원", "억원"],
-    "submission": ["제출", "제안서", "접수", "제출장소", "제출서류", "우편", "방문접수", "전자제출", "나라장터", "usb"],
-    "evaluation": ["평가", "배점", "기술평가", "가격평가", "평가기준", "종합평가", "점수"],
-    "purpose": ["목적", "배경", "필요성", "추진배경", "추진목적", "사업목표", "기대효과"],
-    "deadline": ["마감", "기한", "제출기한", "접수기간", "공고기간", "일정", "제안서 제출일", "입찰일시"],
-    "requirement": ["요구사항", "기능", "구축", "개발", "연계", "성능", "테스트", "과업", "범위"],
-    "qualification": ["자격", "참가자격", "입찰참가", "실적", "인력", "면허", "인증", "등록"],
+TAG_RULES = {
+    "budget": {
+        "strong": ["예산", "사업비", "예산액", "기초금액", "추정금액", "총사업비", "배정예산"],
+        "weak": ["금액", "원", "vat", "부가세"],
+        "threshold": 2,
+    },
+    "submission": {
+        "strong": ["제출", "제안서 제출", "접수", "제출서류", "제출방법", "방문접수", "전자제출"],
+        "weak": ["우편", "이메일", "usb", "마감"],
+        "threshold": 2,
+    },
+    "evaluation": {
+        "strong": ["평가", "평가기준", "배점", "기술평가", "정량평가", "정성평가", "종합평가"],
+        "weak": ["심사", "점수"],
+        "threshold": 2,
+    },
+    "purpose": {
+        "strong": ["목적", "사업목적", "추진목적", "추진배경", "사업개요", "사업목표"],
+        "weak": ["배경", "필요성", "기대효과"],
+        "threshold": 2,
+    },
+    "deadline": {
+        "strong": ["마감", "마감일", "기한", "제출기한", "접수기간", "공고기간", "제안서 제출일시"],
+        "weak": ["일정", "일시", "기간"],
+        "threshold": 2,
+    },
+    "requirement": {
+        "strong": ["요구사항", "과업내용", "과업범위", "기능요건", "기술요건", "상세요건"],
+        "weak": ["요건", "기능", "성능", "범위", "구현"],
+        "threshold": 2,
+    },
+    "qualification": {
+        "strong": ["자격", "참가자격", "입찰참가자격", "제안자격", "자격요건"],
+        "weak": ["실적", "인력", "면허", "등록", "인증"],
+        "threshold": 2,
+    },
 }
+
+TAG_KEYWORDS = {tag: rules["strong"] + rules["weak"] for tag, rules in TAG_RULES.items()}
 
 
 def build_embeddings() -> HuggingFaceEmbeddings:
@@ -54,7 +93,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\*\*==>.*?<==\*\*", "", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"[·•▪■]{3,}", " ", text)
+    text = re.sub(r"[^\S\r\n]{3,}", " ", text)
     text = re.sub(r"\.{4,}", " ", text)
     text = re.sub(r"\n\s*-\d+-\s*\n", "\n", text)
     text = re.sub(r"<br\s*/?>", "\n", text)
@@ -133,14 +172,42 @@ def chunk_section(section: dict, splitter: RecursiveCharacterTextSplitter) -> Li
     return results
 
 
+def normalize_text(text: str) -> str:
+    lowered = text.lower()
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip()
+
+
+def match_keywords(text: str, keywords: List[str]) -> List[str]:
+    normalized = normalize_text(text)
+    return [keyword for keyword in keywords if normalize_text(keyword) in normalized]
+
+
+def score_tags(text: str, section: Optional[str] = None) -> dict[str, dict]:
+    body = text or ""
+    section_text = section or ""
+    scored = {}
+
+    for tag, rules in TAG_RULES.items():
+        strong_hits = match_keywords(body, rules["strong"])
+        weak_hits = match_keywords(body, rules["weak"])
+        section_hits = match_keywords(section_text, rules["strong"] + rules["weak"])
+        score = len(strong_hits) * 2 + len(weak_hits) + len(section_hits) * 2
+
+        if score >= rules["threshold"]:
+            scored[tag] = {
+                "score": score,
+                "strong_hits": strong_hits,
+                "weak_hits": weak_hits,
+                "section_hits": section_hits,
+            }
+
+    return scored
+
+
 def infer_tags(text: str, section: Optional[str] = None) -> dict:
-    search_space = f"{section or ''}\n{text}"
-    matched_tags = []
-
-    for tag, keywords in TAG_KEYWORDS.items():
-        if any(keyword.lower() in search_space.lower() for keyword in keywords):
-            matched_tags.append(tag)
-
+    scored_tags = score_tags(text=text, section=section)
+    matched_tags = sorted(scored_tags, key=lambda tag: (-scored_tags[tag]["score"], tag))
     primary_tag = matched_tags[0] if matched_tags else "general"
     return {
         "primary_tag": primary_tag,
@@ -156,10 +223,14 @@ def infer_tags(text: str, section: Optional[str] = None) -> dict:
 
 
 def extract_pdf_text(file_path: Path) -> str:
+    if pymupdf4llm is None:
+        raise RuntimeError("pymupdf4llm is required to read PDF files.")
     return pymupdf4llm.to_markdown(str(file_path))
 
 
 def extract_hwp_text(file_path: Path) -> str:
+    if olefile is None:
+        raise RuntimeError("olefile is required to read HWP files.")
     try:
         hwp = olefile.OleFileIO(str(file_path))
         if not hwp.exists("FileHeader"):
