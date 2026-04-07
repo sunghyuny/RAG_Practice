@@ -1,0 +1,13 @@
+.env
+__pycache__/
+.venv/
+*.pyc
+files/
+my_rfp_vectordb/
+*.zip
+*.csv
+*.xlsx
+*.json
+*.png
+*.txt
+apiconn.py
