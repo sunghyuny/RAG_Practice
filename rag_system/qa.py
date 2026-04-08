@@ -19,22 +19,22 @@ class SearchPlan(BaseModel):
 
 
 ANSWER_PROMPT = ChatPromptTemplate.from_template(
-    """당신은 공공입찰 RFP 분석을 돕는 어시스턴트입니다.
-아래 검색 결과만 근거로 답변하세요.
+    """?뱀떊? 怨듦났?낆같 RFP 遺꾩꽍???뺣뒗 ?댁떆?ㅽ꽩?몄엯?덈떎.
+?꾨옒 寃??寃곌낵留?洹쇨굅濡??듬??섏꽭??
 
-규칙:
-1. 문서에 없는 내용은 추측하지 말고 "문서에서 확인되지 않습니다."라고 답하세요.
-2. 여러 사업이 섞여 있으면 사업명을 구분해서 설명하세요.
-3. 예산, 제출 방식, 마감일, 요구사항 번호가 보이면 그대로 인용하거나 요약하세요.
-4. 답변 마지막에 근거가 된 문서 제목 목록을 짧게 적으세요.
+洹쒖튃:
+1. 臾몄꽌???녿뒗 ?댁슜? 異붿륫?섏? 留먭퀬 "臾몄꽌?먯꽌 ?뺤씤?섏? ?딆뒿?덈떎."?쇨퀬 ?듯븯?몄슂.
+2. ?щ윭 ?ъ뾽???욎뿬 ?덉쑝硫??ъ뾽紐낆쓣 援щ텇?댁꽌 ?ㅻ챸?섏꽭??
+3. ?덉궛, ?쒖텧 諛⑹떇, 留덇컧?? ?붽뎄?ы빆 踰덊샇媛 蹂댁씠硫?洹몃?濡??몄슜?섍굅???붿빟?섏꽭??
+4. ?듬? 留덉?留됱뿉 洹쇨굅媛 ??臾몄꽌 ?쒕ぉ 紐⑸줉??吏㏐쾶 ?곸쑝?몄슂.
 
-[검색 문서]
+[寃??臾몄꽌]
 {context}
 
-[질문]
+[吏덈Ц]
 {question}
 
-답변:"""
+?듬?:"""
 )
 
 
@@ -50,6 +50,11 @@ def load_titles(vectorstore: Chroma) -> List[str]:
     return sorted({item.get("title", "") for item in metadata["metadatas"] if item.get("title")})
 
 
+def load_issuers(vectorstore: Chroma) -> List[str]:
+    metadata = vectorstore._collection.get(include=["metadatas"])
+    return sorted({item.get("issuer", "") for item in metadata["metadatas"] if item.get("issuer")})
+
+
 def fuzzy_filter_titles(all_titles: List[str], agency: Optional[str] = None, project_name: Optional[str] = None) -> List[str]:
     if not agency and not project_name:
         return []
@@ -62,6 +67,20 @@ def fuzzy_filter_titles(all_titles: List[str], agency: Optional[str] = None, pro
         if agency_ok and project_ok:
             matched.append(title)
     return matched
+
+
+def infer_query_agency(query: str, all_issuers: List[str]) -> Optional[str]:
+    lowered_query = query.lower()
+    matches = []
+
+    for issuer in all_issuers:
+        lowered_issuer = issuer.lower()
+        if lowered_issuer in lowered_query or lowered_query in lowered_issuer:
+            matches.append(issuer)
+
+    if not matches:
+        return None
+    return max(matches, key=len)
 
 
 def build_models():
@@ -145,6 +164,7 @@ def retrieve_documents(
     vectorstore: Chroma,
     planner,
     all_titles: List[str],
+    all_issuers: List[str],
     k: int,
     retrieval_mode: str = "baseline",
 ):
@@ -161,12 +181,17 @@ def retrieve_documents(
         pass
 
     matched_titles = fuzzy_filter_titles(all_titles, agency, project_name)
+    inferred_agency = agency or infer_query_agency(user_query, all_issuers)
     query_tags = infer_query_tags(user_query)
     title_filter = {"title": {"$in": matched_titles}} if matched_titles else None
+    issuer_filter = {"issuer": inferred_agency} if inferred_agency else None
     tag_filter = build_tag_filter(query_tags)
 
     search_results = [
-        run_search(vectorstore, search_query, k, retrieval_mode, combine_filters(title_filter, tag_filter)),
+        run_search(vectorstore, search_query, k, retrieval_mode, combine_filters(title_filter, issuer_filter, tag_filter)),
+        run_search(vectorstore, search_query, k, retrieval_mode, combine_filters(issuer_filter, tag_filter)),
+        run_search(vectorstore, search_query, k, retrieval_mode, combine_filters(title_filter, issuer_filter)),
+        run_search(vectorstore, search_query, k, retrieval_mode, issuer_filter),
         run_search(vectorstore, search_query, k, retrieval_mode, tag_filter),
         run_search(vectorstore, search_query, k, retrieval_mode, title_filter),
         run_search(vectorstore, search_query, k, retrieval_mode),
@@ -180,15 +205,16 @@ def format_docs(docs) -> str:
     for index, doc in enumerate(docs, start=1):
         title = doc.metadata.get("title", "N/A")
         source = doc.metadata.get("source", "N/A")
-        blocks.append(f"[문서 {index}] 사업명: {title} | 파일: {source}\n{doc.page_content}")
+        blocks.append(f"[臾몄꽌 {index}] ?ъ뾽紐? {title} | ?뚯씪: {source}\n{doc.page_content}")
     return "\n\n---\n\n".join(blocks)
 
 
 def answer_query(question: str, k: int = SETTINGS.retrieval_k, retrieval_mode: str = "baseline") -> dict:
     vectorstore = load_vectorstore()
     all_titles = load_titles(vectorstore)
+    all_issuers = load_issuers(vectorstore)
     answer_llm, planner = build_models()
-    docs = retrieve_documents(question, vectorstore, planner, all_titles, k, retrieval_mode=retrieval_mode)
+    docs = retrieve_documents(question, vectorstore, planner, all_titles, all_issuers, k, retrieval_mode=retrieval_mode)
     chain = ANSWER_PROMPT | answer_llm | StrOutputParser()
     answer = chain.invoke({"context": format_docs(docs), "question": question})
     return {"question": question, "answer": answer, "documents": docs}

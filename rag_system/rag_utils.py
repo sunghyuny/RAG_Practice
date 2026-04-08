@@ -1,9 +1,10 @@
+import csv
 import re
 import struct
 import warnings
 import zlib
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 try:
     import olefile
@@ -73,7 +74,19 @@ TAG_RULES = {
 
 TAG_KEYWORDS = {tag: rules["strong"] + rules["weak"] for tag, rules in TAG_RULES.items()}
 
-
+CSV_METADATA_FIELDS = {
+    "공고 번호": "notice_id",
+    "공고 차수": "notice_round",
+    "사업명": "project_name",
+    "사업 금액": "bid_amount",
+    "발주 기관": "issuer",
+    "공개 일자": "posted_at",
+    "입찰 참여 시작일": "bid_start_at",
+    "입찰 참여 마감일": "bid_end_at",
+    "사업 요약": "project_summary",
+    "파일형식": "listed_extension",
+    "파일명": "listed_filename",
+}
 def build_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(
         model_name=SETTINGS.embedding_model,
@@ -178,6 +191,11 @@ def normalize_text(text: str) -> str:
     return lowered.strip()
 
 
+def normalize_filename(text: str) -> str:
+    lowered = normalize_text(text)
+    return re.sub(r"[^0-9a-z가-힣]", "", lowered)
+
+
 def match_keywords(text: str, keywords: List[str]) -> List[str]:
     normalized = normalize_text(text)
     return [keyword for keyword in keywords if normalize_text(keyword) in normalized]
@@ -220,6 +238,34 @@ def infer_tags(text: str, section: Optional[str] = None) -> dict:
         "has_requirement": "requirement" in matched_tags,
         "has_qualification": "qualification" in matched_tags,
     }
+
+
+def load_csv_metadata(csv_path: Path = SETTINGS.metadata_csv_path) -> Dict[str, dict]:
+    if not csv_path.exists():
+        return {}
+
+    metadata_by_filename: Dict[str, dict] = {}
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            filename = (row.get("파일명") or "").strip()
+            if not filename:
+                continue
+
+            mapped = {}
+            for source_key, target_key in CSV_METADATA_FIELDS.items():
+                value = (row.get(source_key) or "").strip()
+                if value:
+                    mapped[target_key] = value
+
+            metadata_by_filename[normalize_filename(filename)] = mapped
+
+    return metadata_by_filename
+
+
+def get_document_metadata(file_path: Path, metadata_by_filename: Optional[Dict[str, dict]] = None) -> dict:
+    metadata_by_filename = metadata_by_filename or {}
+    return metadata_by_filename.get(normalize_filename(file_path.name), {}).copy()
 
 
 def extract_pdf_text(file_path: Path) -> str:
@@ -322,7 +368,11 @@ def extract_text(file_path: Path) -> str:
     return ""
 
 
-def make_documents(file_path: Path, splitter: RecursiveCharacterTextSplitter) -> List[Document]:
+def make_documents(
+    file_path: Path,
+    splitter: RecursiveCharacterTextSplitter,
+    metadata_by_filename: Optional[Dict[str, dict]] = None,
+) -> List[Document]:
     raw_text = extract_text(file_path)
     if not raw_text.strip():
         return []
@@ -330,6 +380,7 @@ def make_documents(file_path: Path, splitter: RecursiveCharacterTextSplitter) ->
     cleaned = clean_text(raw_text)
     sections = split_into_sections(cleaned)
     title = file_path.stem
+    mapped_metadata = get_document_metadata(file_path, metadata_by_filename)
     docs: List[Document] = []
 
     chunk_index = 0
@@ -349,6 +400,7 @@ def make_documents(file_path: Path, splitter: RecursiveCharacterTextSplitter) ->
                         "chunk_id": chunk_index,
                         "extension": file_path.suffix.lower(),
                         "section": section_name or "문서 개요",
+                        **mapped_metadata,
                         **infer_tags(chunk, section_name),
                     },
                 )

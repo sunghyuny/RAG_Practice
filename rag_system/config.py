@@ -17,6 +17,7 @@ if load_dotenv is not None:
 class Settings:
     base_dir: Path = Path("./files").resolve()
     db_path: Path = Path("./my_rfp_vectordb").resolve()
+    metadata_csv_path: Path = Path("./data_list.csv").resolve()
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "jhgan/ko-sroberta-multitask")
     chat_model: str = os.getenv("CHAT_MODEL", "gpt-5-mini")
     chunk_size: int = int(os.getenv("CHUNK_SIZE", "1000"))

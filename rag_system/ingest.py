@@ -5,7 +5,13 @@ from pathlib import Path
 from langchain_chroma import Chroma
 
 from rag_system.config import SETTINGS
-from rag_system.rag_utils import build_embeddings, build_text_splitter, iter_source_files, make_documents
+from rag_system.rag_utils import (
+    build_embeddings,
+    build_text_splitter,
+    iter_source_files,
+    load_csv_metadata,
+    make_documents,
+)
 
 
 def ingest_documents(
@@ -24,10 +30,11 @@ def ingest_documents(
         shutil.rmtree(db_path)
 
     splitter = build_text_splitter()
+    metadata_by_filename = load_csv_metadata()
     documents = []
 
     for file_path in files:
-        documents.extend(make_documents(file_path, splitter))
+        documents.extend(make_documents(file_path, splitter, metadata_by_filename=metadata_by_filename))
 
     if not documents:
         raise RuntimeError("Text extraction produced no chunks. Check the source documents.")
