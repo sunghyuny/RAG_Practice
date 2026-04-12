@@ -63,6 +63,37 @@ DATA_TABLE_KEYWORDS = (
     "합계",
 )
 
+HEADER_KEYWORDS = (
+    "구분",
+    "항목",
+    "내용",
+    "비고",
+    "금액",
+    "배점",
+    "평가기준",
+    "요구사항",
+    "요구사항 ID",
+    "요구사항 명칭",
+    "수량",
+    "단가",
+    "합계",
+)
+
+BULLET_MARKERS = ("□", "○", "-", "◈", "※", "ㆍ")
+
+HEADER_GROUPS = (
+    ("구분", "항목", "내용"),
+    ("구분", "내용", "비고"),
+    ("요구사항", "ID", "명칭"),
+    ("요구사항", "분류", "명칭"),
+    ("평가", "배점", "기준"),
+    ("평가항목", "배점", "평가기준"),
+    ("일정", "기간", "비고"),
+    ("예산", "금액", "합계"),
+    ("수량", "단가", "금액"),
+    ("구분", "역할", "비고"),
+)
+
 
 @dataclass
 class HwpTableArtifact:
@@ -76,6 +107,7 @@ class HwpTableArtifact:
     toc_score: int
     cover_score: int
     data_score: int
+    header_group_hits: int
     text: str
 
 
@@ -153,6 +185,10 @@ def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) ->
 
     outline_lines = count_outline_lines(lines)
     numeric_lines = count_numeric_lines(lines)
+    header_hit_count = sum(1 for keyword in HEADER_KEYWORDS if keyword in text)
+    bullet_line_count = sum(1 for line in lines if line.startswith(BULLET_MARKERS))
+    long_line_count = sum(1 for line in lines if len(line) >= 40)
+    header_group_hits = max(sum(1 for keyword in group if keyword in text) for group in HEADER_GROUPS)
 
     if outline_lines >= 3:
         toc_score += 2
@@ -172,12 +208,30 @@ def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) ->
         data_score += 2
 
     if toc_score >= 4:
-        return "toc", toc_score, cover_score, data_score
+        return "toc", toc_score, cover_score, data_score, header_group_hits
     if cover_score >= 4 and data_score <= 3:
-        return "cover", toc_score, cover_score, data_score
-    if data_score >= 4:
-        return "data_table", toc_score, cover_score, data_score
-    return "uncertain", toc_score, cover_score, data_score
+        return "cover", toc_score, cover_score, data_score, header_group_hits
+
+    # Gate-based table classification:
+    # - sure_table: strong structural signals + a full 3-of-3 header group match.
+    # - review_needed: enough structure + a 2-of-3 header group match.
+    passes_structure_gate = row_hint_count >= 3 and paragraph_count >= 3
+    passes_strict_structure_gate = row_hint_count >= 5 and paragraph_count >= 4
+    passes_content_gate = data_score >= 4
+    looks_like_explanatory_block = bullet_line_count >= 2 and long_line_count >= 2 and header_hit_count < 2
+
+    if (
+        passes_strict_structure_gate
+        and header_group_hits >= 3
+        and passes_content_gate
+        and not looks_like_explanatory_block
+    ):
+        return "sure_table", toc_score, cover_score, data_score, header_group_hits
+
+    if passes_structure_gate and header_group_hits >= 2 and passes_content_gate:
+        return "review_needed", toc_score, cover_score, data_score, header_group_hits
+
+    return "uncertain", toc_score, cover_score, data_score, header_group_hits
 
 
 def iter_hwp_records(file_path: Path):
@@ -238,7 +292,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
         if rec_type == 71 and control_id == TABLE_CONTROL_ID:
             if active_table and active_table["paragraphs"]:
                 text = "\n".join(active_table["paragraphs"]).strip()
-                classification, toc_score, cover_score, data_score = classify_table_text(
+                classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
                     text=text,
                     row_hint_count=active_table["row_hints"],
                     paragraph_count=len(active_table["paragraphs"]),
@@ -255,6 +309,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         toc_score=toc_score,
                         cover_score=cover_score,
                         data_score=data_score,
+                        header_group_hits=header_group_hits,
                         text=text,
                     )
                 )
@@ -275,7 +330,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
         if rec_type == 71 and control_id != TABLE_CONTROL_ID:
             if active_table["paragraphs"]:
                 text = "\n".join(active_table["paragraphs"]).strip()
-                classification, toc_score, cover_score, data_score = classify_table_text(
+                classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
                     text=text,
                     row_hint_count=active_table["row_hints"],
                     paragraph_count=len(active_table["paragraphs"]),
@@ -292,6 +347,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         toc_score=toc_score,
                         cover_score=cover_score,
                         data_score=data_score,
+                        header_group_hits=header_group_hits,
                         text=text,
                     )
                 )
@@ -301,7 +357,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
         if rec_type not in TABLE_RELATED_TYPES:
             if active_table["paragraphs"]:
                 text = "\n".join(active_table["paragraphs"]).strip()
-                classification, toc_score, cover_score, data_score = classify_table_text(
+                classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
                     text=text,
                     row_hint_count=active_table["row_hints"],
                     paragraph_count=len(active_table["paragraphs"]),
@@ -318,6 +374,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         toc_score=toc_score,
                         cover_score=cover_score,
                         data_score=data_score,
+                        header_group_hits=header_group_hits,
                         text=text,
                     )
                 )
@@ -333,7 +390,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
 
     if active_table and active_table["paragraphs"]:
         text = "\n".join(active_table["paragraphs"]).strip()
-        classification, toc_score, cover_score, data_score = classify_table_text(
+        classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
             text=text,
             row_hint_count=active_table["row_hints"],
             paragraph_count=len(active_table["paragraphs"]),
@@ -350,6 +407,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                 toc_score=toc_score,
                 cover_score=cover_score,
                 data_score=data_score,
+                header_group_hits=header_group_hits,
                 text=text,
             )
         )
@@ -405,7 +463,8 @@ def extract_hwp_artifacts(file_path: Path, save_images: bool = False, output_dir
         "table_count": len(tables),
         "toc_table_count": sum(1 for table in tables if table.classification == "toc"),
         "cover_table_count": sum(1 for table in tables if table.classification == "cover"),
-        "data_table_count": sum(1 for table in tables if table.classification == "data_table"),
+        "sure_table_count": sum(1 for table in tables if table.classification == "sure_table"),
+        "review_needed_count": sum(1 for table in tables if table.classification == "review_needed"),
         "uncertain_table_count": sum(1 for table in tables if table.classification == "uncertain"),
         "image_count": len(images),
         "tables": [asdict(table) for table in tables],
@@ -417,7 +476,8 @@ def summarize(payload: dict) -> str:
     lines = [
         f"source: {payload['source_name']}",
         f"tables: {payload['table_count']}",
-        f"  data_table: {payload['data_table_count']}",
+        f"  sure_table: {payload['sure_table_count']}",
+        f"  review_needed: {payload['review_needed_count']}",
         f"  toc: {payload['toc_table_count']}",
         f"  cover: {payload['cover_table_count']}",
         f"  uncertain: {payload['uncertain_table_count']}",
@@ -430,7 +490,7 @@ def summarize(payload: dict) -> str:
             f"table {table['table_index']}: class={table['classification']} "
             f"section={table['section']} row_hints={table['row_hint_count']} "
             f"paragraphs={table['paragraph_count']} text_length={table['text_length']} "
-            f"(toc={table['toc_score']}, cover={table['cover_score']}, data={table['data_score']})"
+            f"(toc={table['toc_score']}, cover={table['cover_score']}, data={table['data_score']}, header_hits={table['header_group_hits']})"
         )
         preview = table["text"][:200].replace("\n", " / ")
         lines.append(f"   preview: {preview}")
