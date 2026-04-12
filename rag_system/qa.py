@@ -19,22 +19,22 @@ class SearchPlan(BaseModel):
 
 
 ANSWER_PROMPT = ChatPromptTemplate.from_template(
-    """?뱀떊? 怨듦났?낆같 RFP 遺꾩꽍???뺣뒗 ?댁떆?ㅽ꽩?몄엯?덈떎.
-?꾨옒 寃??寃곌낵留?洹쇨굅濡??듬??섏꽭??
+    """당신은 공공입찰 RFP 분석을 돕는 어시스턴트입니다.
+아래 검색 결과만 근거로 답변하세요.
 
-洹쒖튃:
-1. 臾몄꽌???녿뒗 ?댁슜? 異붿륫?섏? 留먭퀬 "臾몄꽌?먯꽌 ?뺤씤?섏? ?딆뒿?덈떎."?쇨퀬 ?듯븯?몄슂.
-2. ?щ윭 ?ъ뾽???욎뿬 ?덉쑝硫??ъ뾽紐낆쓣 援щ텇?댁꽌 ?ㅻ챸?섏꽭??
-3. ?덉궛, ?쒖텧 諛⑹떇, 留덇컧?? ?붽뎄?ы빆 踰덊샇媛 蹂댁씠硫?洹몃?濡??몄슜?섍굅???붿빟?섏꽭??
-4. ?듬? 留덉?留됱뿉 洹쇨굅媛 ??臾몄꽌 ?쒕ぉ 紐⑸줉??吏㏐쾶 ?곸쑝?몄슂.
+규칙:
+1. 문서에 없는 내용은 추측하지 말고 "문서에서 확인되지 않습니다."라고 답하세요.
+2. 여러 사업이 섞여 있으면 사업명을 구분해서 설명하세요.
+3. 예산, 기관명, 제출 방식, 마감일, 요구사항 번호가 보이면 그대로 인용하거나 요약하세요.
+4. 답변 마지막에 근거 문서 제목 목록을 짧게 적어주세요.
 
-[寃??臾몄꽌]
+[검색 문서]
 {context}
 
-[吏덈Ц]
+[질문]
 {question}
 
-?듬?:"""
+[답변]:"""
 )
 
 
@@ -205,7 +205,7 @@ def format_docs(docs) -> str:
     for index, doc in enumerate(docs, start=1):
         title = doc.metadata.get("title", "N/A")
         source = doc.metadata.get("source", "N/A")
-        blocks.append(f"[臾몄꽌 {index}] ?ъ뾽紐? {title} | ?뚯씪: {source}\n{doc.page_content}")
+        blocks.append(f"[문서 {index}] 사업명: {title} | 파일: {source}\n{doc.page_content}")
     return "\n\n---\n\n".join(blocks)
 
 
