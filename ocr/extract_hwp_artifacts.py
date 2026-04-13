@@ -92,7 +92,21 @@ HEADER_GROUPS = (
     ("예산", "금액", "합계"),
     ("수량", "단가", "금액"),
     ("구분", "역할", "비고"),
+    ("번호", "보안약점", "설명"),
+    ("구분", "항목", "적용계획"),
+    ("적용계획", "미적용", "사유"),
 )
+
+SECOND_PASS_KEYWORD_GROUPS = {
+    "basic_headers": ("구분", "항목", "내용", "비고"),
+    "requirements_eval": ("요구사항", "평가", "배점", "기준", "평가기준"),
+    "schedule_amount": ("일정", "기간", "예산", "금액", "합계", "수량", "단가"),
+    "form_fields": ("업체명", "대표자", "주소", "전화번호", "접수번호", "처리일", "제출서류"),
+    "roles_org": ("역할", "담당", "부서", "책임자", "PM"),
+    "system_map": ("신청", "보고", "결과", "조회", "자료실", "통계", "출력", "완료", "보류"),
+    "software_stack": ("상용SW", "버전", "서버", "DB", "검색엔진", "프레임워크", "WAS"),
+    "security_plan": ("보안약점", "적용계획", "미적용", "사유", "인증", "암호화"),
+}
 
 
 @dataclass
@@ -103,11 +117,15 @@ class HwpTableArtifact:
     row_hint_count: int
     paragraph_count: int
     text_length: int
-    classification: str
+    first_pass_classification: str
     toc_score: int
     cover_score: int
     data_score: int
     header_group_hits: int
+    missing_signals: list[str]
+    second_pass_bonus: int
+    second_pass_reason: list[str]
+    final_classification: str
     text: str
 
 
@@ -150,8 +168,21 @@ def decode_para_text(payload: bytes) -> str:
     return "\n".join(line.strip() for line in text.splitlines()).strip()
 
 
+def normalize_for_match(text: str) -> str:
+    return "".join(text.replace("\x1f", "").split())
+
+
 def count_keyword_hits(text: str, keywords: tuple[str, ...]) -> int:
-    return sum(text.count(keyword) for keyword in keywords)
+    normalized_text = normalize_for_match(text)
+    return sum(max(text.count(keyword), normalized_text.count(normalize_for_match(keyword))) for keyword in keywords)
+
+
+def count_group_hits(text: str) -> dict[str, int]:
+    normalized_text = normalize_for_match(text)
+    hits: dict[str, int] = {}
+    for group_name, keywords in SECOND_PASS_KEYWORD_GROUPS.items():
+        hits[group_name] = sum(1 for keyword in keywords if normalize_for_match(keyword) in normalized_text)
+    return hits
 
 
 def count_outline_lines(lines: list[str]) -> int:
@@ -178,6 +209,7 @@ def count_numeric_lines(lines: list[str]) -> int:
 
 def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) -> tuple[str, int, int, int]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    normalized_text = normalize_for_match(text)
 
     toc_score = count_keyword_hits(text, TOC_KEYWORDS)
     cover_score = count_keyword_hits(text, COVER_KEYWORDS)
@@ -185,17 +217,19 @@ def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) ->
 
     outline_lines = count_outline_lines(lines)
     numeric_lines = count_numeric_lines(lines)
-    header_hit_count = sum(1 for keyword in HEADER_KEYWORDS if keyword in text)
+    header_hit_count = sum(1 for keyword in HEADER_KEYWORDS if normalize_for_match(keyword) in normalized_text)
     bullet_line_count = sum(1 for line in lines if line.startswith(BULLET_MARKERS))
     long_line_count = sum(1 for line in lines if len(line) >= 40)
-    header_group_hits = max(sum(1 for keyword in group if keyword in text) for group in HEADER_GROUPS)
+    header_group_hits = max(
+        sum(1 for keyword in group if normalize_for_match(keyword) in normalized_text) for group in HEADER_GROUPS
+    )
 
     if outline_lines >= 3:
         toc_score += 2
     if any(line == "목차" or line == "차례" for line in lines):
         toc_score += 3
 
-    if paragraph_count <= 4 and row_hint_count <= 5 and text.count("제안요청서") > 0:
+    if paragraph_count <= 4 and row_hint_count <= 5 and normalize_for_match("제안요청서") in normalized_text:
         cover_score += 2
     if paragraph_count <= 4 and any("2024." in line or "2025." in line or "2026." in line for line in lines):
         cover_score += 1
@@ -204,7 +238,7 @@ def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) ->
         data_score += 1
     if numeric_lines >= max(3, len(lines) // 2):
         data_score += 1
-    if any(keyword in text for keyword in ("구분", "항목", "내용", "비고")):
+    if any(normalize_for_match(keyword) in normalized_text for keyword in ("구분", "항목", "내용", "비고")):
         data_score += 2
 
     if toc_score >= 4:
@@ -232,6 +266,176 @@ def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) ->
         return "review_needed", toc_score, cover_score, data_score, header_group_hits
 
     return "uncertain", toc_score, cover_score, data_score, header_group_hits
+
+
+def analyze_missing_signals(
+    text: str,
+    first_pass_classification: str,
+    row_hint_count: int,
+    paragraph_count: int,
+    data_score: int,
+    header_group_hits: int,
+) -> tuple[list[str], int, list[str]]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    normalized_text = normalize_for_match(text)
+    group_hits = count_group_hits(text)
+    total_group_hits = sum(group_hits.values())
+    bullet_line_count = sum(1 for line in lines if line.startswith(BULLET_MARKERS))
+    long_line_count = sum(1 for line in lines if len(line) >= 40)
+    short_label_lines = sum(1 for line in lines if 1 <= len(line) <= 12)
+    arrow_lines = sum(1 for line in lines if "→" in line or "->" in line)
+    label_keywords = (
+        "대민사이트",
+        "BackOffice",
+        "추가사항",
+        "추진목표",
+        "추진과제",
+        "추진일정",
+        "추진체계",
+        "역할",
+        "구분",
+    )
+    label_keyword_hits = sum(1 for keyword in label_keywords if normalize_for_match(keyword) in normalized_text)
+    first_lines_compact = "".join(normalize_for_match(line) for line in lines[:3])
+    stacked_label_hit = any(
+        keyword in first_lines_compact for keyword in ("추진목표", "추진과제", "추진일정", "추진체계및역할", "추진체계")
+    )
+
+    missing_signals: list[str] = []
+    reasons: list[str] = []
+    bonus = 0
+
+    if row_hint_count >= 5 and data_score >= 4 and header_group_hits < 2:
+        missing_signals.append("weak_header_match")
+        reasons.append("row hints are strong but header match is weak")
+        bonus += 2
+
+    if (short_label_lines >= 3 and label_keyword_hits >= 1) or stacked_label_hit:
+        missing_signals.append("left_label_column_pattern")
+        reasons.append("short label-like lines repeat with category keywords")
+        bonus += 2
+
+    if row_hint_count >= 6 and (arrow_lines >= 1 or label_keyword_hits >= 2 or stacked_label_hit):
+        missing_signals.append("box_layout_like")
+        reasons.append("layout looks like a boxed or diagram-like table")
+        bonus += 2
+
+    if total_group_hits >= 6 and sum(1 for hit in group_hits.values() if hit > 0) >= 2:
+        missing_signals.append("important_field_block")
+        reasons.append("multiple business field groups appear strongly in the same block")
+        bonus += 2
+
+    if group_hits["system_map"] >= 4:
+        missing_signals.append("system_map_like")
+        reasons.append("system/menu map terms repeat across the block")
+        bonus += 2
+
+    if (
+        "제도안내" in normalized_text
+        or "신청방법" in normalized_text
+        or ("결과" in normalized_text and "보고" in normalized_text)
+    ) and group_hits["system_map"] >= 2:
+        missing_signals.append("menu_flow_like")
+        reasons.append("menu or workflow labels repeat like a system map")
+        bonus += 2
+
+    if group_hits["form_fields"] >= 3:
+        missing_signals.append("form_field_like")
+        reasons.append("structured business form fields repeat across the block")
+        bonus += 2
+
+    if "제출서류" in normalized_text and ("목록" in normalized_text or "제출" in normalized_text) and short_label_lines >= 4:
+        missing_signals.append("submission_list_like")
+        reasons.append("submission document list looks like a structured checklist table")
+        bonus += 2
+
+    overview_keywords = ("사업개요", "사업명", "사업기간", "소요예산", "계약방식", "선정절차")
+    overview_hits = sum(1 for keyword in overview_keywords if keyword in normalized_text)
+    if overview_hits >= 3:
+        missing_signals.append("project_overview_like")
+        reasons.append("project overview fields repeat in a structured block")
+        bonus += 2
+
+    if group_hits["schedule_amount"] >= 3 and row_hint_count >= 3:
+        missing_signals.append("schedule_amount_like")
+        reasons.append("schedule or amount fields repeat with table-like structure")
+        bonus += 2
+
+    if ("대상업체" in normalized_text or "참가자격" in normalized_text) and ("사업금액" in normalized_text or "매출액" in normalized_text):
+        missing_signals.append("eligibility_threshold_like")
+        reasons.append("eligibility and threshold fields repeat in a structured qualification block")
+        bonus += 2
+
+    if group_hits["software_stack"] >= 3 and row_hint_count >= 3:
+        missing_signals.append("software_stack_like")
+        reasons.append("software or infrastructure inventory terms repeat across the block")
+        bonus += 2
+
+    if ("PM" in normalized_text or "사업관리자" in normalized_text) and "부문" in normalized_text:
+        missing_signals.append("staffing_plan_like")
+        reasons.append("staffing or responsibility fields repeat in a plan block")
+        bonus += 2
+
+    if (
+        bullet_line_count >= 2
+        and long_line_count >= 2
+        and header_group_hits < 2
+        and label_keyword_hits == 0
+        and total_group_hits < 6
+        and overview_hits < 3
+    ):
+        missing_signals.append("explanatory_block")
+        reasons.append("bullet-heavy explanatory prose dominates the block")
+        bonus -= 2
+
+    if first_pass_classification == "review_needed" and header_group_hits >= 2 and row_hint_count >= 5:
+        missing_signals.append("promotable_review_table")
+        reasons.append("review table has enough structure to be promoted on second pass")
+        bonus += 1
+
+    return missing_signals, bonus, reasons
+
+
+def second_pass_classify(
+    first_pass_classification: str,
+    missing_signals: list[str],
+    second_pass_bonus: int,
+) -> str:
+    if first_pass_classification in {"cover", "toc"}:
+        return first_pass_classification
+
+    if first_pass_classification == "sure_table":
+        return "final_sure_table"
+
+    if first_pass_classification == "review_needed":
+        if second_pass_bonus >= 1 and "explanatory_block" not in missing_signals:
+            return "final_sure_table"
+        return "final_review_table"
+
+    if first_pass_classification == "uncertain":
+        has_structural_recovery_signal = any(
+            signal in missing_signals
+            for signal in (
+                "left_label_column_pattern",
+                "box_layout_like",
+                "weak_header_match",
+                "important_field_block",
+                "system_map_like",
+                "menu_flow_like",
+                "form_field_like",
+                "submission_list_like",
+                "project_overview_like",
+                "schedule_amount_like",
+                "eligibility_threshold_like",
+                "software_stack_like",
+                "staffing_plan_like",
+            )
+        )
+        if second_pass_bonus >= 2 and has_structural_recovery_signal and "explanatory_block" not in missing_signals:
+            return "final_review_table"
+        return "discarded_table"
+
+    return "discarded_table"
 
 
 def iter_hwp_records(file_path: Path):
@@ -297,6 +501,19 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                     row_hint_count=active_table["row_hints"],
                     paragraph_count=len(active_table["paragraphs"]),
                 )
+                missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
+                    text=text,
+                    first_pass_classification=classification,
+                    row_hint_count=active_table["row_hints"],
+                    paragraph_count=len(active_table["paragraphs"]),
+                    data_score=data_score,
+                    header_group_hits=header_group_hits,
+                )
+                final_classification = second_pass_classify(
+                    first_pass_classification=classification,
+                    missing_signals=missing_signals,
+                    second_pass_bonus=second_pass_bonus,
+                )
                 tables.append(
                     HwpTableArtifact(
                         table_index=len(tables) + 1,
@@ -305,11 +522,15 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         row_hint_count=active_table["row_hints"],
                         paragraph_count=len(active_table["paragraphs"]),
                         text_length=len(text),
-                        classification=classification,
+                        first_pass_classification=classification,
                         toc_score=toc_score,
                         cover_score=cover_score,
                         data_score=data_score,
                         header_group_hits=header_group_hits,
+                        missing_signals=missing_signals,
+                        second_pass_bonus=second_pass_bonus,
+                        second_pass_reason=second_pass_reason,
+                        final_classification=final_classification,
                         text=text,
                     )
                 )
@@ -335,6 +556,19 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                     row_hint_count=active_table["row_hints"],
                     paragraph_count=len(active_table["paragraphs"]),
                 )
+                missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
+                    text=text,
+                    first_pass_classification=classification,
+                    row_hint_count=active_table["row_hints"],
+                    paragraph_count=len(active_table["paragraphs"]),
+                    data_score=data_score,
+                    header_group_hits=header_group_hits,
+                )
+                final_classification = second_pass_classify(
+                    first_pass_classification=classification,
+                    missing_signals=missing_signals,
+                    second_pass_bonus=second_pass_bonus,
+                )
                 tables.append(
                     HwpTableArtifact(
                         table_index=len(tables) + 1,
@@ -343,11 +577,15 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         row_hint_count=active_table["row_hints"],
                         paragraph_count=len(active_table["paragraphs"]),
                         text_length=len(text),
-                        classification=classification,
+                        first_pass_classification=classification,
                         toc_score=toc_score,
                         cover_score=cover_score,
                         data_score=data_score,
                         header_group_hits=header_group_hits,
+                        missing_signals=missing_signals,
+                        second_pass_bonus=second_pass_bonus,
+                        second_pass_reason=second_pass_reason,
+                        final_classification=final_classification,
                         text=text,
                     )
                 )
@@ -362,6 +600,19 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                     row_hint_count=active_table["row_hints"],
                     paragraph_count=len(active_table["paragraphs"]),
                 )
+                missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
+                    text=text,
+                    first_pass_classification=classification,
+                    row_hint_count=active_table["row_hints"],
+                    paragraph_count=len(active_table["paragraphs"]),
+                    data_score=data_score,
+                    header_group_hits=header_group_hits,
+                )
+                final_classification = second_pass_classify(
+                    first_pass_classification=classification,
+                    missing_signals=missing_signals,
+                    second_pass_bonus=second_pass_bonus,
+                )
                 tables.append(
                     HwpTableArtifact(
                         table_index=len(tables) + 1,
@@ -370,11 +621,15 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         row_hint_count=active_table["row_hints"],
                         paragraph_count=len(active_table["paragraphs"]),
                         text_length=len(text),
-                        classification=classification,
+                        first_pass_classification=classification,
                         toc_score=toc_score,
                         cover_score=cover_score,
                         data_score=data_score,
                         header_group_hits=header_group_hits,
+                        missing_signals=missing_signals,
+                        second_pass_bonus=second_pass_bonus,
+                        second_pass_reason=second_pass_reason,
+                        final_classification=final_classification,
                         text=text,
                     )
                 )
@@ -395,6 +650,19 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
             row_hint_count=active_table["row_hints"],
             paragraph_count=len(active_table["paragraphs"]),
         )
+        missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
+            text=text,
+            first_pass_classification=classification,
+            row_hint_count=active_table["row_hints"],
+            paragraph_count=len(active_table["paragraphs"]),
+            data_score=data_score,
+            header_group_hits=header_group_hits,
+        )
+        final_classification = second_pass_classify(
+            first_pass_classification=classification,
+            missing_signals=missing_signals,
+            second_pass_bonus=second_pass_bonus,
+        )
         tables.append(
             HwpTableArtifact(
                 table_index=len(tables) + 1,
@@ -403,11 +671,15 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                 row_hint_count=active_table["row_hints"],
                 paragraph_count=len(active_table["paragraphs"]),
                 text_length=len(text),
-                classification=classification,
+                first_pass_classification=classification,
                 toc_score=toc_score,
                 cover_score=cover_score,
                 data_score=data_score,
                 header_group_hits=header_group_hits,
+                missing_signals=missing_signals,
+                second_pass_bonus=second_pass_bonus,
+                second_pass_reason=second_pass_reason,
+                final_classification=final_classification,
                 text=text,
             )
         )
@@ -461,11 +733,14 @@ def extract_hwp_artifacts(file_path: Path, save_images: bool = False, output_dir
         "file_type": ".hwp",
         "status": "ok",
         "table_count": len(tables),
-        "toc_table_count": sum(1 for table in tables if table.classification == "toc"),
-        "cover_table_count": sum(1 for table in tables if table.classification == "cover"),
-        "sure_table_count": sum(1 for table in tables if table.classification == "sure_table"),
-        "review_needed_count": sum(1 for table in tables if table.classification == "review_needed"),
-        "uncertain_table_count": sum(1 for table in tables if table.classification == "uncertain"),
+        "toc_table_count": sum(1 for table in tables if table.first_pass_classification == "toc"),
+        "cover_table_count": sum(1 for table in tables if table.first_pass_classification == "cover"),
+        "sure_table_count": sum(1 for table in tables if table.first_pass_classification == "sure_table"),
+        "review_needed_count": sum(1 for table in tables if table.first_pass_classification == "review_needed"),
+        "uncertain_table_count": sum(1 for table in tables if table.first_pass_classification == "uncertain"),
+        "final_sure_table_count": sum(1 for table in tables if table.final_classification == "final_sure_table"),
+        "final_review_table_count": sum(1 for table in tables if table.final_classification == "final_review_table"),
+        "discarded_table_count": sum(1 for table in tables if table.final_classification == "discarded_table"),
         "image_count": len(images),
         "tables": [asdict(table) for table in tables],
         "images": [asdict(image) for image in images],
@@ -481,19 +756,24 @@ def summarize(payload: dict) -> str:
         f"  toc: {payload['toc_table_count']}",
         f"  cover: {payload['cover_table_count']}",
         f"  uncertain: {payload['uncertain_table_count']}",
+        f"  final_sure_table: {payload['final_sure_table_count']}",
+        f"  final_review_table: {payload['final_review_table_count']}",
+        f"  discarded_table: {payload['discarded_table_count']}",
         f"images: {payload['image_count']}",
         "",
     ]
 
     for table in payload["tables"][:3]:
         lines.append(
-            f"table {table['table_index']}: class={table['classification']} "
+            f"table {table['table_index']}: first={table['first_pass_classification']} final={table['final_classification']} "
             f"section={table['section']} row_hints={table['row_hint_count']} "
             f"paragraphs={table['paragraph_count']} text_length={table['text_length']} "
-            f"(toc={table['toc_score']}, cover={table['cover_score']}, data={table['data_score']}, header_hits={table['header_group_hits']})"
+            f"(toc={table['toc_score']}, cover={table['cover_score']}, data={table['data_score']}, header_hits={table['header_group_hits']}, bonus={table['second_pass_bonus']})"
         )
         preview = table["text"][:200].replace("\n", " / ")
         lines.append(f"   preview: {preview}")
+        if table["missing_signals"]:
+            lines.append(f"   missing_signals: {', '.join(table['missing_signals'])}")
 
     for index, image in enumerate(payload["images"][:5], start=1):
         lines.append(
