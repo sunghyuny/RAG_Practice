@@ -126,6 +126,11 @@ class HwpTableArtifact:
     second_pass_bonus: int
     second_pass_reason: list[str]
     final_classification: str
+    storage_bucket: str
+    section_header_role: str | None
+    linked_parent_table_index: int | None
+    linked_parent_text: str | None
+    linked_child_table_indices: list[int]
     text: str
 
 
@@ -210,6 +215,7 @@ def count_numeric_lines(lines: list[str]) -> int:
 def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) -> tuple[str, int, int, int]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     normalized_text = normalize_for_match(text)
+    group_hits = count_group_hits(text)
 
     toc_score = count_keyword_hits(text, TOC_KEYWORDS)
     cover_score = count_keyword_hits(text, COVER_KEYWORDS)
@@ -223,6 +229,8 @@ def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) ->
     header_group_hits = max(
         sum(1 for keyword in group if normalize_for_match(keyword) in normalized_text) for group in HEADER_GROUPS
     )
+    active_group_count = sum(1 for hit in group_hits.values() if hit > 0)
+    strongest_group_hit = max(group_hits.values(), default=0)
 
     if outline_lines >= 3:
         toc_score += 2
@@ -252,6 +260,7 @@ def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) ->
     passes_structure_gate = row_hint_count >= 3 and paragraph_count >= 3
     passes_strict_structure_gate = row_hint_count >= 5 and paragraph_count >= 4
     passes_content_gate = data_score >= 4
+    passes_field_gate = data_score >= 3 and (active_group_count >= 2 or strongest_group_hit >= 3)
     looks_like_explanatory_block = bullet_line_count >= 2 and long_line_count >= 2 and header_hit_count < 2
 
     if (
@@ -263,6 +272,26 @@ def classify_table_text(text: str, row_hint_count: int, paragraph_count: int) ->
         return "sure_table", toc_score, cover_score, data_score, header_group_hits
 
     if passes_structure_gate and header_group_hits >= 2 and passes_content_gate:
+        return "review_needed", toc_score, cover_score, data_score, header_group_hits
+
+    # Some useful business tables are field-heavy rather than header-heavy.
+    # We keep them in review if structure exists and multiple field groups repeat.
+    if (
+        row_hint_count >= 5
+        and paragraph_count >= 4
+        and header_group_hits >= 1
+        and passes_field_gate
+        and not looks_like_explanatory_block
+    ):
+        return "review_needed", toc_score, cover_score, data_score, header_group_hits
+
+    if (
+        row_hint_count >= 8
+        and paragraph_count >= 6
+        and active_group_count >= 2
+        and data_score >= 3
+        and not looks_like_explanatory_block
+    ):
         return "review_needed", toc_score, cover_score, data_score, header_group_hits
 
     return "uncertain", toc_score, cover_score, data_score, header_group_hits
@@ -344,6 +373,19 @@ def analyze_missing_signals(
         reasons.append("structured business form fields repeat across the block")
         bonus += 2
 
+    if (
+        row_hint_count >= 5
+        and (
+            group_hits["form_fields"] >= 2
+            or group_hits["schedule_amount"] >= 2
+            or group_hits["requirements_eval"] >= 2
+            or group_hits["roles_org"] >= 2
+        )
+    ):
+        missing_signals.append("field_value_table_like")
+        reasons.append("field-value pairs repeat with enough row structure to look tabular")
+        bonus += 2
+
     if "제출서류" in normalized_text and ("목록" in normalized_text or "제출" in normalized_text) and short_label_lines >= 4:
         missing_signals.append("submission_list_like")
         reasons.append("submission document list looks like a structured checklist table")
@@ -410,6 +452,8 @@ def second_pass_classify(
     if first_pass_classification == "review_needed":
         if second_pass_bonus >= 1 and "explanatory_block" not in missing_signals:
             return "final_sure_table"
+        if "explanatory_block" in missing_signals:
+            return "explanatory_block"
         return "final_review_table"
 
     if first_pass_classification == "uncertain":
@@ -429,13 +473,87 @@ def second_pass_classify(
                 "eligibility_threshold_like",
                 "software_stack_like",
                 "staffing_plan_like",
+                "field_value_table_like",
             )
         )
         if second_pass_bonus >= 2 and has_structural_recovery_signal and "explanatory_block" not in missing_signals:
             return "final_review_table"
+        if "explanatory_block" in missing_signals:
+            return "explanatory_block"
         return "discarded_table"
 
     return "discarded_table"
+
+
+def classify_storage_bucket(final_classification: str) -> str:
+    if final_classification in {"final_sure_table", "final_review_table"}:
+        return "structural_table"
+    if final_classification == "explanatory_block":
+        return "explanatory_block"
+    if final_classification in {"cover", "toc"}:
+        return "excluded"
+    return "discarded"
+
+
+def is_section_header_candidate(table: HwpTableArtifact) -> bool:
+    lines = [line.strip() for line in table.text.splitlines() if line.strip()]
+    normalized_text = normalize_for_match(table.text)
+    if table.storage_bucket != "discarded":
+        return False
+    if len(lines) > 3:
+        return False
+    if table.text_length > 80:
+        return False
+
+    header_terms = (
+        "요구사항",
+        "정의표",
+        "추진내용",
+        "추진개요",
+        "추진방안",
+        "제안요청",
+        "기능요구사항",
+        "성능요구사항",
+        "데이터요구사항",
+        "보안요구사항",
+        "테스트요구사항",
+        "인터페이스요구사항",
+        "프로젝트관리요구사항",
+        "프로젝트지원요구사항",
+    )
+    has_header_term = any(term in normalized_text for term in header_terms)
+    looks_like_compact_header = table.paragraph_count <= 3 and table.row_hint_count <= 4
+    return has_header_term and looks_like_compact_header
+
+
+def attach_section_header_links(tables: list[HwpTableArtifact]) -> None:
+    for idx, table in enumerate(tables):
+        if not is_section_header_candidate(table):
+            continue
+
+        child_indices: list[int] = []
+        for candidate in tables[idx + 1 : idx + 6]:
+            if candidate.section != table.section:
+                break
+            if is_section_header_candidate(candidate):
+                break
+            if candidate.record_start_index - table.record_start_index > 1000:
+                break
+            if candidate.storage_bucket == "structural_table":
+                child_indices.append(candidate.table_index)
+                if candidate.linked_parent_table_index is None:
+                    candidate.linked_parent_table_index = table.table_index
+                    candidate.linked_parent_text = table.text.replace("\n", " / ")
+            elif candidate.storage_bucket == "discarded" and candidate.paragraph_count <= 2 and candidate.text_length <= 80:
+                # Allow one more compact title/subtitle block before the actual tables.
+                continue
+            else:
+                break
+
+        if child_indices:
+            table.section_header_role = "section_header_block"
+            table.linked_child_table_indices = child_indices
+            table.storage_bucket = "section_header_block"
 
 
 def iter_hwp_records(file_path: Path):
@@ -531,6 +649,11 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         second_pass_bonus=second_pass_bonus,
                         second_pass_reason=second_pass_reason,
                         final_classification=final_classification,
+                        storage_bucket=classify_storage_bucket(final_classification),
+                        section_header_role=None,
+                        linked_parent_table_index=None,
+                        linked_parent_text=None,
+                        linked_child_table_indices=[],
                         text=text,
                     )
                 )
@@ -586,6 +709,11 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         second_pass_bonus=second_pass_bonus,
                         second_pass_reason=second_pass_reason,
                         final_classification=final_classification,
+                        storage_bucket=classify_storage_bucket(final_classification),
+                        section_header_role=None,
+                        linked_parent_table_index=None,
+                        linked_parent_text=None,
+                        linked_child_table_indices=[],
                         text=text,
                     )
                 )
@@ -630,6 +758,11 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                         second_pass_bonus=second_pass_bonus,
                         second_pass_reason=second_pass_reason,
                         final_classification=final_classification,
+                        storage_bucket=classify_storage_bucket(final_classification),
+                        section_header_role=None,
+                        linked_parent_table_index=None,
+                        linked_parent_text=None,
+                        linked_child_table_indices=[],
                         text=text,
                     )
                 )
@@ -680,10 +813,16 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
                 second_pass_bonus=second_pass_bonus,
                 second_pass_reason=second_pass_reason,
                 final_classification=final_classification,
+                storage_bucket=classify_storage_bucket(final_classification),
+                section_header_role=None,
+                linked_parent_table_index=None,
+                linked_parent_text=None,
+                linked_child_table_indices=[],
                 text=text,
             )
         )
 
+    attach_section_header_links(tables)
     return tables
 
 
@@ -740,8 +879,17 @@ def extract_hwp_artifacts(file_path: Path, save_images: bool = False, output_dir
         "uncertain_table_count": sum(1 for table in tables if table.first_pass_classification == "uncertain"),
         "final_sure_table_count": sum(1 for table in tables if table.final_classification == "final_sure_table"),
         "final_review_table_count": sum(1 for table in tables if table.final_classification == "final_review_table"),
+        "explanatory_block_count": sum(1 for table in tables if table.final_classification == "explanatory_block"),
         "discarded_table_count": sum(1 for table in tables if table.final_classification == "discarded_table"),
+        "structural_table_count": sum(1 for table in tables if table.storage_bucket == "structural_table"),
+        "section_header_block_count": sum(1 for table in tables if table.storage_bucket == "section_header_block"),
+        "excluded_table_count": sum(1 for table in tables if table.storage_bucket == "excluded"),
         "image_count": len(images),
+        "structural_tables": [asdict(table) for table in tables if table.storage_bucket == "structural_table"],
+        "section_header_blocks": [asdict(table) for table in tables if table.storage_bucket == "section_header_block"],
+        "explanatory_blocks": [asdict(table) for table in tables if table.storage_bucket == "explanatory_block"],
+        "discarded_tables": [asdict(table) for table in tables if table.storage_bucket == "discarded"],
+        "excluded_tables": [asdict(table) for table in tables if table.storage_bucket == "excluded"],
         "tables": [asdict(table) for table in tables],
         "images": [asdict(image) for image in images],
     }
@@ -758,7 +906,11 @@ def summarize(payload: dict) -> str:
         f"  uncertain: {payload['uncertain_table_count']}",
         f"  final_sure_table: {payload['final_sure_table_count']}",
         f"  final_review_table: {payload['final_review_table_count']}",
+        f"  section_header_block: {payload['section_header_block_count']}",
+        f"  explanatory_block: {payload['explanatory_block_count']}",
         f"  discarded_table: {payload['discarded_table_count']}",
+        f"  structural_table: {payload['structural_table_count']}",
+        f"  excluded_table: {payload['excluded_table_count']}",
         f"images: {payload['image_count']}",
         "",
     ]
@@ -768,7 +920,7 @@ def summarize(payload: dict) -> str:
             f"table {table['table_index']}: first={table['first_pass_classification']} final={table['final_classification']} "
             f"section={table['section']} row_hints={table['row_hint_count']} "
             f"paragraphs={table['paragraph_count']} text_length={table['text_length']} "
-            f"(toc={table['toc_score']}, cover={table['cover_score']}, data={table['data_score']}, header_hits={table['header_group_hits']}, bonus={table['second_pass_bonus']})"
+            f"(toc={table['toc_score']}, cover={table['cover_score']}, data={table['data_score']}, header_hits={table['header_group_hits']}, bonus={table['second_pass_bonus']}, bucket={table['storage_bucket']})"
         )
         preview = table["text"][:200].replace("\n", " / ")
         lines.append(f"   preview: {preview}")

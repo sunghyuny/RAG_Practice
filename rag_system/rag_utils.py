@@ -1,6 +1,7 @@
 import csv
 import re
 import struct
+import sys
 import warnings
 import zlib
 from pathlib import Path
@@ -20,6 +21,12 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from rag_system.config import SETTINGS
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from ocr.extract_hwp_artifacts import extract_hwp_artifacts
 
 
 warnings.filterwarnings("ignore")
@@ -90,7 +97,10 @@ CSV_METADATA_FIELDS = {
 def build_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(
         model_name=SETTINGS.embedding_model,
-        model_kwargs={"device": SETTINGS.embedding_device},
+        model_kwargs={
+            "device": SETTINGS.embedding_device,
+            "local_files_only": True,
+        },
     )
 
 
@@ -359,11 +369,41 @@ def extract_hwp_text(file_path: Path) -> str:
         return ""
 
 
+def build_hwp_semantic_text(file_path: Path) -> str:
+    payload = extract_hwp_artifacts(file_path, save_images=False, output_dir=ROOT_DIR / "ocr")
+
+    blocks: List[str] = []
+
+    for table in payload.get("structural_tables", []):
+        parent_text = table.get("linked_parent_text")
+        title_line = f"[STRUCTURAL_TABLE] {parent_text}" if parent_text else "[STRUCTURAL_TABLE]"
+        body = table.get("text", "").strip()
+        if body:
+            blocks.append(f"{title_line}\n{body}")
+
+    for block in payload.get("explanatory_blocks", []):
+        body = block.get("text", "").strip()
+        if body:
+            blocks.append(f"[EXPLANATORY_BLOCK]\n{body}")
+
+    for header in payload.get("section_header_blocks", []):
+        if header.get("linked_child_table_indices"):
+            child_labels = ", ".join(str(idx) for idx in header["linked_child_table_indices"])
+            body = header.get("text", "").strip()
+            if body:
+                blocks.append(f"[SECTION_HEADER] children={child_labels}\n{body}")
+
+    return "\n\n".join(blocks).strip()
+
+
 def extract_text(file_path: Path) -> str:
     suffix = file_path.suffix.lower()
     if suffix == ".pdf":
         return extract_pdf_text(file_path)
     if suffix == ".hwp":
+        semantic_text = build_hwp_semantic_text(file_path)
+        if semantic_text:
+            return semantic_text
         return extract_hwp_text(file_path)
     return ""
 
