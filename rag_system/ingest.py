@@ -5,7 +5,7 @@ from pathlib import Path
 from langchain_chroma import Chroma
 
 from rag_system.config import SETTINGS
-from rag_system.rag_utils import (
+from rag_system.table_pipeline.rag_utils import (
     build_embeddings,
     build_text_splitter,
     iter_source_files,

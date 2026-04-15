@@ -10,7 +10,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from rag_system.config import SETTINGS, require_env
-from rag_system.rag_utils import build_embeddings, score_tags
+from rag_system.table_pipeline.rag_utils import build_embeddings, score_tags
 
 
 class SearchPlan(BaseModel):
