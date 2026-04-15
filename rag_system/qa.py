@@ -1,4 +1,5 @@
 import argparse
+import re
 from typing import List, Optional
 
 from langchain_chroma import Chroma
@@ -138,25 +139,123 @@ def unique_documents(doc_lists: List[List[Document]], limit: int) -> List[Docume
     return merged
 
 
+TABLE_QUERY_KEYWORDS = {
+    "배점",
+    "평가",
+    "평가기준",
+    "평가항목",
+    "점수",
+    "등급",
+    "일정",
+    "사업기간",
+    "기간",
+    "산출물",
+    "수행실적",
+    "제출서류",
+    "예산",
+    "표",
+}
+
+FUNCTION_QUERY_KEYWORDS = {
+    "기능",
+    "구성",
+    "흐름",
+    "절차",
+    "로그인",
+    "회원가입",
+    "권한",
+    "승인",
+    "관리",
+    "산식",
+    "계산",
+    "증명서",
+    "발급",
+    "화면",
+}
+
+
+def infer_query_profile(query: str) -> set[str]:
+    lowered = query.lower()
+    profile = set()
+
+    if any(keyword in query for keyword in TABLE_QUERY_KEYWORDS):
+        profile.add("table")
+    if any(keyword in query for keyword in FUNCTION_QUERY_KEYWORDS):
+        profile.add("function")
+    if re.search(r"\b(?:SFR|PMR|FUN|CNR)[-_ ]?\d+", query, re.IGNORECASE):
+        profile.add("requirement_id")
+    if any(keyword in lowered for keyword in ["ocr", "도식", "구성도", "흐름도"]):
+        profile.add("function")
+
+    return profile
+
+
+def score_rerank(query: str, doc: Document, rank: int) -> float:
+    profile = infer_query_profile(query)
+    content = doc.page_content
+    lowered_content = content.lower()
+    score = float(max(0, 30 - rank))
+
+    if "table" in profile and "[STRUCTURAL_TABLE]" in content:
+        score += 12
+    if "table" in profile and any(keyword in content for keyword in ["배점", "평가", "일정", "산출물", "수행실적", "점수", "등급"]):
+        score += 6
+
+    if "function" in profile and "[IMAGE_OCR]" in content:
+        score += 12
+    if "function" in profile and any(keyword in content for keyword in ["로그인", "회원가입", "권한", "승인", "기능", "산식", "계산", "증명서"]):
+        score += 7
+
+    if "requirement_id" in profile:
+        pattern = re.search(r"\b((?:SFR|PMR|FUN|CNR)[-_ ]?\d+)\b", query, re.IGNORECASE)
+        if pattern and pattern.group(1).lower().replace(" ", "") in lowered_content.replace(" ", ""):
+            score += 15
+
+    query_terms = [term for term in re.findall(r"[가-힣A-Za-z0-9]+", query) if len(term) >= 2]
+    overlap = sum(1 for term in query_terms if term.lower() in lowered_content)
+    score += min(overlap, 8)
+
+    if "function" in profile and "[STRUCTURAL_TABLE]" in content and "[IMAGE_OCR]" not in content:
+        score -= 2
+    if "table" in profile and "[IMAGE_OCR]" in content and "[STRUCTURAL_TABLE]" not in content:
+        score -= 2
+
+    return score
+
+
+def rerank_documents(query: str, docs: List[Document], limit: int) -> List[Document]:
+    scored = [
+        (score_rerank(query, doc, rank), rank, doc)
+        for rank, doc in enumerate(docs, start=1)
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [doc for _, _, doc in scored[:limit]]
+
+
 def run_search(vectorstore: Chroma, query: str, k: int, retrieval_mode: str = "baseline", search_filter=None) -> List[Document]:
+    fetch_k = max(k * 4, 20)
+
     if retrieval_mode == "baseline":
         if search_filter:
-            return vectorstore.similarity_search(query=query, k=k, filter=search_filter)
-        return vectorstore.similarity_search(query=query, k=k)
+            docs = vectorstore.similarity_search(query=query, k=fetch_k, filter=search_filter)
+        else:
+            docs = vectorstore.similarity_search(query=query, k=fetch_k)
+        return rerank_documents(query, docs, k)
 
-    fetch_k = max(k * 4, 20)
     if search_filter:
-        return vectorstore.max_marginal_relevance_search(
+        docs = vectorstore.max_marginal_relevance_search(
             query=query,
-            k=k,
+            k=fetch_k,
             fetch_k=fetch_k,
             filter=search_filter,
         )
-    return vectorstore.max_marginal_relevance_search(
+    else:
+        docs = vectorstore.max_marginal_relevance_search(
         query=query,
-        k=k,
-        fetch_k=fetch_k,
-    )
+            k=fetch_k,
+            fetch_k=fetch_k,
+        )
+    return rerank_documents(query, docs, k)
 
 
 def retrieve_documents(

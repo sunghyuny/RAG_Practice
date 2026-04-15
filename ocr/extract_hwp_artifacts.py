@@ -131,6 +131,9 @@ class HwpTableArtifact:
     linked_parent_table_index: int | None
     linked_parent_text: str | None
     linked_child_table_indices: list[int]
+    ocr_candidate_score: int
+    ocr_candidate_priority: str
+    ocr_candidate_reasons: list[str]
     text: str
 
 
@@ -140,6 +143,9 @@ class HwpImageArtifact:
     ext: str
     size_bytes: int
     saved_path: str | None
+    ocr_candidate_score: int
+    ocr_candidate_priority: str
+    ocr_candidate_reasons: list[str]
 
 
 def decode_para_text(payload: bytes) -> str:
@@ -495,6 +501,93 @@ def classify_storage_bucket(final_classification: str) -> str:
     return "discarded"
 
 
+def classify_candidate_priority(score: int) -> str:
+    if score >= 8:
+        return "high"
+    if score >= 4:
+        return "medium"
+    return "low"
+
+
+def score_table_ocr_candidate(table: HwpTableArtifact) -> tuple[int, str, list[str]]:
+    reasons: list[str] = []
+    score = 0
+
+    if table.storage_bucket != "structural_table":
+        return 0, "low", reasons
+
+    # Tables already promoted to review usually need visual recovery more than
+    # fully structured tables, so they are our default OCR-first targets.
+    if table.final_classification == "final_review_table":
+        score += 4
+        reasons.append("review table needs visual recovery more than fully structured tables")
+    elif table.final_classification == "final_sure_table":
+        score += 1
+        reasons.append("structured table is already usable, so OCR need starts low")
+
+    if table.header_group_hits <= 1 and table.row_hint_count >= 5:
+        score += 3
+        reasons.append("row structure is strong but header recovery is weak")
+    elif table.header_group_hits == 2 and table.row_hint_count >= 5:
+        score += 1
+        reasons.append("table is mostly structured but still has partial header ambiguity")
+
+    structural_signals = {
+        "weak_header_match": 2,
+        "left_label_column_pattern": 2,
+        "box_layout_like": 3,
+        "menu_flow_like": 3,
+        "field_value_table_like": 2,
+        "schedule_amount_like": 2,
+        "submission_list_like": 2,
+        "project_overview_like": 2,
+        "software_stack_like": 2,
+        "staffing_plan_like": 2,
+        "eligibility_threshold_like": 2,
+    }
+    for signal, bonus in structural_signals.items():
+        if signal in table.missing_signals:
+            score += bonus
+            reasons.append(f"missing signal detected: {signal}")
+
+    if table.linked_parent_text:
+        score += 1
+        reasons.append("section header is attached, which usually means this table belongs to a larger structured set")
+
+    if table.text_length >= 300:
+        score += 1
+        reasons.append("table text is large enough that structure loss can meaningfully hurt retrieval")
+
+    priority = classify_candidate_priority(score)
+    return score, priority, reasons
+
+
+def score_image_ocr_candidate(image: HwpImageArtifact) -> tuple[int, str, list[str]]:
+    reasons: list[str] = []
+    score = 0
+
+    if image.size_bytes >= 300_000:
+        score += 5
+        reasons.append("large embedded image is more likely to be a meaningful diagram or screen capture")
+    elif image.size_bytes >= 100_000:
+        score += 3
+        reasons.append("medium-size embedded image is worth checking for OCR")
+    elif image.size_bytes >= 30_000:
+        score += 1
+        reasons.append("image is not tiny, so it may still contain readable content")
+
+    if image.ext in {"png", "jpg", "jpeg", "bmp"}:
+        score += 1
+        reasons.append("common raster image format is suitable for OCR")
+
+    if image.name.lower().startswith(("bin", "image", "img")):
+        score += 1
+        reasons.append("generic embedded image name suggests a document-inserted visual rather than metadata")
+
+    priority = classify_candidate_priority(score)
+    return score, priority, reasons
+
+
 def is_section_header_candidate(table: HwpTableArtifact) -> bool:
     lines = [line.strip() for line in table.text.splitlines() if line.strip()]
     normalized_text = normalize_for_match(table.text)
@@ -556,6 +649,62 @@ def attach_section_header_links(tables: list[HwpTableArtifact]) -> None:
             table.storage_bucket = "section_header_block"
 
 
+def build_table_artifact(
+    tables: list[HwpTableArtifact],
+    active_table: dict,
+    text: str,
+) -> HwpTableArtifact:
+    classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
+        text=text,
+        row_hint_count=active_table["row_hints"],
+        paragraph_count=len(active_table["paragraphs"]),
+    )
+    missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
+        text=text,
+        first_pass_classification=classification,
+        row_hint_count=active_table["row_hints"],
+        paragraph_count=len(active_table["paragraphs"]),
+        data_score=data_score,
+        header_group_hits=header_group_hits,
+    )
+    final_classification = second_pass_classify(
+        first_pass_classification=classification,
+        missing_signals=missing_signals,
+        second_pass_bonus=second_pass_bonus,
+    )
+    placeholder = HwpTableArtifact(
+        table_index=len(tables) + 1,
+        section=active_table["section"],
+        record_start_index=active_table["record_start_index"],
+        row_hint_count=active_table["row_hints"],
+        paragraph_count=len(active_table["paragraphs"]),
+        text_length=len(text),
+        first_pass_classification=classification,
+        toc_score=toc_score,
+        cover_score=cover_score,
+        data_score=data_score,
+        header_group_hits=header_group_hits,
+        missing_signals=missing_signals,
+        second_pass_bonus=second_pass_bonus,
+        second_pass_reason=second_pass_reason,
+        final_classification=final_classification,
+        storage_bucket=classify_storage_bucket(final_classification),
+        section_header_role=None,
+        linked_parent_table_index=None,
+        linked_parent_text=None,
+        linked_child_table_indices=[],
+        ocr_candidate_score=0,
+        ocr_candidate_priority="low",
+        ocr_candidate_reasons=[],
+        text=text,
+    )
+    score, priority, reasons = score_table_ocr_candidate(placeholder)
+    placeholder.ocr_candidate_score = score
+    placeholder.ocr_candidate_priority = priority
+    placeholder.ocr_candidate_reasons = reasons
+    return placeholder
+
+
 def iter_hwp_records(file_path: Path):
     ole = olefile.OleFileIO(str(file_path))
     header_data = ole.openstream("FileHeader").read()
@@ -614,49 +763,7 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
         if rec_type == 71 and control_id == TABLE_CONTROL_ID:
             if active_table and active_table["paragraphs"]:
                 text = "\n".join(active_table["paragraphs"]).strip()
-                classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
-                    text=text,
-                    row_hint_count=active_table["row_hints"],
-                    paragraph_count=len(active_table["paragraphs"]),
-                )
-                missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
-                    text=text,
-                    first_pass_classification=classification,
-                    row_hint_count=active_table["row_hints"],
-                    paragraph_count=len(active_table["paragraphs"]),
-                    data_score=data_score,
-                    header_group_hits=header_group_hits,
-                )
-                final_classification = second_pass_classify(
-                    first_pass_classification=classification,
-                    missing_signals=missing_signals,
-                    second_pass_bonus=second_pass_bonus,
-                )
-                tables.append(
-                    HwpTableArtifact(
-                        table_index=len(tables) + 1,
-                        section=active_table["section"],
-                        record_start_index=active_table["record_start_index"],
-                        row_hint_count=active_table["row_hints"],
-                        paragraph_count=len(active_table["paragraphs"]),
-                        text_length=len(text),
-                        first_pass_classification=classification,
-                        toc_score=toc_score,
-                        cover_score=cover_score,
-                        data_score=data_score,
-                        header_group_hits=header_group_hits,
-                        missing_signals=missing_signals,
-                        second_pass_bonus=second_pass_bonus,
-                        second_pass_reason=second_pass_reason,
-                        final_classification=final_classification,
-                        storage_bucket=classify_storage_bucket(final_classification),
-                        section_header_role=None,
-                        linked_parent_table_index=None,
-                        linked_parent_text=None,
-                        linked_child_table_indices=[],
-                        text=text,
-                    )
-                )
+                tables.append(build_table_artifact(tables, active_table, text))
 
             active_table = {
                 "section": record["section"],
@@ -674,98 +781,14 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
         if rec_type == 71 and control_id != TABLE_CONTROL_ID:
             if active_table["paragraphs"]:
                 text = "\n".join(active_table["paragraphs"]).strip()
-                classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
-                    text=text,
-                    row_hint_count=active_table["row_hints"],
-                    paragraph_count=len(active_table["paragraphs"]),
-                )
-                missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
-                    text=text,
-                    first_pass_classification=classification,
-                    row_hint_count=active_table["row_hints"],
-                    paragraph_count=len(active_table["paragraphs"]),
-                    data_score=data_score,
-                    header_group_hits=header_group_hits,
-                )
-                final_classification = second_pass_classify(
-                    first_pass_classification=classification,
-                    missing_signals=missing_signals,
-                    second_pass_bonus=second_pass_bonus,
-                )
-                tables.append(
-                    HwpTableArtifact(
-                        table_index=len(tables) + 1,
-                        section=active_table["section"],
-                        record_start_index=active_table["record_start_index"],
-                        row_hint_count=active_table["row_hints"],
-                        paragraph_count=len(active_table["paragraphs"]),
-                        text_length=len(text),
-                        first_pass_classification=classification,
-                        toc_score=toc_score,
-                        cover_score=cover_score,
-                        data_score=data_score,
-                        header_group_hits=header_group_hits,
-                        missing_signals=missing_signals,
-                        second_pass_bonus=second_pass_bonus,
-                        second_pass_reason=second_pass_reason,
-                        final_classification=final_classification,
-                        storage_bucket=classify_storage_bucket(final_classification),
-                        section_header_role=None,
-                        linked_parent_table_index=None,
-                        linked_parent_text=None,
-                        linked_child_table_indices=[],
-                        text=text,
-                    )
-                )
+                tables.append(build_table_artifact(tables, active_table, text))
             active_table = None
             continue
 
         if rec_type not in TABLE_RELATED_TYPES:
             if active_table["paragraphs"]:
                 text = "\n".join(active_table["paragraphs"]).strip()
-                classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
-                    text=text,
-                    row_hint_count=active_table["row_hints"],
-                    paragraph_count=len(active_table["paragraphs"]),
-                )
-                missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
-                    text=text,
-                    first_pass_classification=classification,
-                    row_hint_count=active_table["row_hints"],
-                    paragraph_count=len(active_table["paragraphs"]),
-                    data_score=data_score,
-                    header_group_hits=header_group_hits,
-                )
-                final_classification = second_pass_classify(
-                    first_pass_classification=classification,
-                    missing_signals=missing_signals,
-                    second_pass_bonus=second_pass_bonus,
-                )
-                tables.append(
-                    HwpTableArtifact(
-                        table_index=len(tables) + 1,
-                        section=active_table["section"],
-                        record_start_index=active_table["record_start_index"],
-                        row_hint_count=active_table["row_hints"],
-                        paragraph_count=len(active_table["paragraphs"]),
-                        text_length=len(text),
-                        first_pass_classification=classification,
-                        toc_score=toc_score,
-                        cover_score=cover_score,
-                        data_score=data_score,
-                        header_group_hits=header_group_hits,
-                        missing_signals=missing_signals,
-                        second_pass_bonus=second_pass_bonus,
-                        second_pass_reason=second_pass_reason,
-                        final_classification=final_classification,
-                        storage_bucket=classify_storage_bucket(final_classification),
-                        section_header_role=None,
-                        linked_parent_table_index=None,
-                        linked_parent_text=None,
-                        linked_child_table_indices=[],
-                        text=text,
-                    )
-                )
+                tables.append(build_table_artifact(tables, active_table, text))
             active_table = None
             continue
 
@@ -778,51 +801,14 @@ def extract_hwp_tables(file_path: Path) -> list[HwpTableArtifact]:
 
     if active_table and active_table["paragraphs"]:
         text = "\n".join(active_table["paragraphs"]).strip()
-        classification, toc_score, cover_score, data_score, header_group_hits = classify_table_text(
-            text=text,
-            row_hint_count=active_table["row_hints"],
-            paragraph_count=len(active_table["paragraphs"]),
-        )
-        missing_signals, second_pass_bonus, second_pass_reason = analyze_missing_signals(
-            text=text,
-            first_pass_classification=classification,
-            row_hint_count=active_table["row_hints"],
-            paragraph_count=len(active_table["paragraphs"]),
-            data_score=data_score,
-            header_group_hits=header_group_hits,
-        )
-        final_classification = second_pass_classify(
-            first_pass_classification=classification,
-            missing_signals=missing_signals,
-            second_pass_bonus=second_pass_bonus,
-        )
-        tables.append(
-            HwpTableArtifact(
-                table_index=len(tables) + 1,
-                section=active_table["section"],
-                record_start_index=active_table["record_start_index"],
-                row_hint_count=active_table["row_hints"],
-                paragraph_count=len(active_table["paragraphs"]),
-                text_length=len(text),
-                first_pass_classification=classification,
-                toc_score=toc_score,
-                cover_score=cover_score,
-                data_score=data_score,
-                header_group_hits=header_group_hits,
-                missing_signals=missing_signals,
-                second_pass_bonus=second_pass_bonus,
-                second_pass_reason=second_pass_reason,
-                final_classification=final_classification,
-                storage_bucket=classify_storage_bucket(final_classification),
-                section_header_role=None,
-                linked_parent_table_index=None,
-                linked_parent_text=None,
-                linked_child_table_indices=[],
-                text=text,
-            )
-        )
+        tables.append(build_table_artifact(tables, active_table, text))
 
     attach_section_header_links(tables)
+    for table in tables:
+        score, priority, reasons = score_table_ocr_candidate(table)
+        table.ocr_candidate_score = score
+        table.ocr_candidate_priority = priority
+        table.ocr_candidate_reasons = reasons
     return tables
 
 
@@ -847,12 +833,26 @@ def extract_hwp_images(file_path: Path, save_dir: Path | None = None) -> list[Hw
                 image_path.write_bytes(data)
                 saved_path = str(image_path.resolve())
 
+            temp_image = HwpImageArtifact(
+                name=name,
+                ext=ext,
+                size_bytes=len(data),
+                saved_path=saved_path,
+                ocr_candidate_score=0,
+                ocr_candidate_priority="low",
+                ocr_candidate_reasons=[],
+            )
+            image_score, image_priority, image_reasons = score_image_ocr_candidate(temp_image)
+
             images.append(
                 HwpImageArtifact(
                     name=name,
                     ext=ext,
                     size_bytes=len(data),
                     saved_path=saved_path,
+                    ocr_candidate_score=image_score,
+                    ocr_candidate_priority=image_priority,
+                    ocr_candidate_reasons=image_reasons,
                 )
             )
     finally:
@@ -865,6 +865,12 @@ def extract_hwp_artifacts(file_path: Path, save_images: bool = False, output_dir
     image_dir = output_dir / "hwp_images" if save_images and output_dir is not None else None
     tables = extract_hwp_tables(file_path)
     images = extract_hwp_images(file_path, save_dir=image_dir)
+    table_ocr_candidates = [
+        asdict(table)
+        for table in tables
+        if table.storage_bucket == "structural_table" and table.ocr_candidate_score >= 4
+    ]
+    image_ocr_candidates = [asdict(image) for image in images if image.ocr_candidate_score >= 4]
 
     return {
         "source_path": str(file_path.resolve()),
@@ -885,11 +891,15 @@ def extract_hwp_artifacts(file_path: Path, save_images: bool = False, output_dir
         "section_header_block_count": sum(1 for table in tables if table.storage_bucket == "section_header_block"),
         "excluded_table_count": sum(1 for table in tables if table.storage_bucket == "excluded"),
         "image_count": len(images),
+        "table_ocr_candidate_count": len(table_ocr_candidates),
+        "image_ocr_candidate_count": len(image_ocr_candidates),
         "structural_tables": [asdict(table) for table in tables if table.storage_bucket == "structural_table"],
         "section_header_blocks": [asdict(table) for table in tables if table.storage_bucket == "section_header_block"],
         "explanatory_blocks": [asdict(table) for table in tables if table.storage_bucket == "explanatory_block"],
         "discarded_tables": [asdict(table) for table in tables if table.storage_bucket == "discarded"],
         "excluded_tables": [asdict(table) for table in tables if table.storage_bucket == "excluded"],
+        "table_ocr_candidates": table_ocr_candidates,
+        "image_ocr_candidates": image_ocr_candidates,
         "tables": [asdict(table) for table in tables],
         "images": [asdict(image) for image in images],
     }
@@ -910,8 +920,10 @@ def summarize(payload: dict) -> str:
         f"  explanatory_block: {payload['explanatory_block_count']}",
         f"  discarded_table: {payload['discarded_table_count']}",
         f"  structural_table: {payload['structural_table_count']}",
+        f"  table_ocr_candidate: {payload['table_ocr_candidate_count']}",
         f"  excluded_table: {payload['excluded_table_count']}",
         f"images: {payload['image_count']}",
+        f"  image_ocr_candidate: {payload['image_ocr_candidate_count']}",
         "",
     ]
 
@@ -920,16 +932,19 @@ def summarize(payload: dict) -> str:
             f"table {table['table_index']}: first={table['first_pass_classification']} final={table['final_classification']} "
             f"section={table['section']} row_hints={table['row_hint_count']} "
             f"paragraphs={table['paragraph_count']} text_length={table['text_length']} "
-            f"(toc={table['toc_score']}, cover={table['cover_score']}, data={table['data_score']}, header_hits={table['header_group_hits']}, bonus={table['second_pass_bonus']}, bucket={table['storage_bucket']})"
+            f"(toc={table['toc_score']}, cover={table['cover_score']}, data={table['data_score']}, header_hits={table['header_group_hits']}, bonus={table['second_pass_bonus']}, bucket={table['storage_bucket']}, ocr_score={table['ocr_candidate_score']}, ocr_priority={table['ocr_candidate_priority']})"
         )
         preview = table["text"][:200].replace("\n", " / ")
         lines.append(f"   preview: {preview}")
         if table["missing_signals"]:
             lines.append(f"   missing_signals: {', '.join(table['missing_signals'])}")
+        if table["ocr_candidate_reasons"]:
+            lines.append(f"   ocr_candidate_reasons: {', '.join(table['ocr_candidate_reasons'][:3])}")
 
     for index, image in enumerate(payload["images"][:5], start=1):
         lines.append(
-            f"image {index}: {image['name']} ext={image['ext']} size={image['size_bytes']} saved={image['saved_path']}"
+            f"image {index}: {image['name']} ext={image['ext']} size={image['size_bytes']} "
+            f"ocr_score={image['ocr_candidate_score']} ocr_priority={image['ocr_candidate_priority']} saved={image['saved_path']}"
         )
 
     return "\n".join(lines)
