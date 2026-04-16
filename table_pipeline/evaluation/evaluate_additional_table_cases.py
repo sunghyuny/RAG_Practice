@@ -2,8 +2,8 @@ import argparse
 from pathlib import Path
 from time import perf_counter
 
+from table_pipeline.evaluation.additional_table_cases import ADDITIONAL_TABLE_CASES
 from rag_system.qa import load_vectorstore, run_search
-from rag_system.table_pipeline.table_retrieval_cases import TABLE_RETRIEVAL_CASES
 
 
 def title_matches(doc_title: str, expected_title_contains: str) -> bool:
@@ -11,28 +11,28 @@ def title_matches(doc_title: str, expected_title_contains: str) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate retrieval hit rate for curated table-focused queries.")
+    parser = argparse.ArgumentParser(description="Evaluate retrieval hit rate for additional table-focused queries.")
     parser.add_argument(
         "--retrieval-mode",
         choices=["baseline", "mmr"],
-        default="baseline",
+        default="mmr",
         help="Retrieval strategy to evaluate",
     )
     parser.add_argument("--k", type=int, default=5, help="Number of chunks to retrieve")
     args = parser.parse_args()
 
     vectorstore = load_vectorstore()
-    output_path = Path(f"table_retrieval_cases_{args.retrieval_mode}.txt")
+    output_path = Path(f"additional_table_cases_{args.retrieval_mode}.txt")
     started_at = perf_counter()
     top1_hits = 0
     top3_hits = 0
 
     with output_path.open("w", encoding="utf-8") as handle:
-        handle.write("Curated table retrieval evaluation\n")
+        handle.write("Additional table retrieval evaluation\n")
         handle.write(f"Retrieval mode: {args.retrieval_mode}\n")
         handle.write("=" * 60 + "\n\n")
 
-        for index, case in enumerate(TABLE_RETRIEVAL_CASES, start=1):
+        for index, case in enumerate(ADDITIONAL_TABLE_CASES, start=1):
             query_started_at = perf_counter()
             docs = run_search(vectorstore, case["query"], args.k, retrieval_mode=args.retrieval_mode)
             elapsed = perf_counter() - query_started_at
@@ -68,13 +68,13 @@ def main() -> None:
 
             handle.write("\n" + "-" * 60 + "\n\n")
 
-        total_cases = len(TABLE_RETRIEVAL_CASES)
+        total_cases = len(ADDITIONAL_TABLE_CASES)
         total_elapsed = perf_counter() - started_at
         handle.write(f"Top1 hits: {top1_hits}/{total_cases}\n")
         handle.write(f"Top3 hits: {top3_hits}/{total_cases}\n")
         handle.write(f"Total elapsed: {total_elapsed:.2f}s\n")
 
-    print(f"Saved curated retrieval evaluation to {output_path.resolve()}.")
+    print(f"Saved additional retrieval evaluation to {output_path.resolve()}.")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 from time import perf_counter
 
-from rag_system.evaluate_table_focus import TABLE_FOCUSED_QUERIES
+from table_pipeline.evaluation.evaluate_table_focus import TABLE_FOCUSED_QUERIES
 from rag_system.qa import load_vectorstore, run_search
 
 

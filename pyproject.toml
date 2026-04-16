@@ -1,0 +1,18 @@
+[project]
+name = "rag-practice"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain-chroma>=1.1.0",
+    "langchain-core>=1.2.30",
+    "langchain-huggingface>=1.2.1",
+    "langchain-openai>=1.1.13",
+    "langchain-text-splitters>=1.1.1",
+    "olefile>=0.47",
+    "pillow>=12.2.0",
+    "pydantic>=2.13.1",
+    "pymupdf>=1.27.2.2",
+    "pymupdf4llm>=1.27.2.2",
+    "python-dotenv>=1.2.2",
+    "rapidocr-onnxruntime>=1.4.4",
+]

@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 
 
 def resolve_python() -> str:
@@ -43,7 +43,7 @@ def main() -> None:
             print(f"\n작업 종료 (exit code: {code})\n")
         elif choice == "2":
             code = run_module(
-                "rag_system.table_pipeline.eval_questions_table_runner",
+                "table_pipeline.evaluation.eval_questions_table_runner",
                 "--groups",
                 "TB",
                 "TC",
@@ -55,7 +55,7 @@ def main() -> None:
             print(f"\n작업 종료 (exit code: {code})\n")
         elif choice == "3":
             code = run_module(
-                "rag_system.table_pipeline.evaluate_all_hwp_docname_cases",
+                "table_pipeline.evaluation.evaluate_all_hwp_docname_cases",
                 "--retrieval-mode",
                 "mmr",
                 "--k",
@@ -64,7 +64,7 @@ def main() -> None:
             print(f"\n작업 종료 (exit code: {code})\n")
         elif choice == "4":
             code = run_module(
-                "rag_system.table_pipeline.dump_eval_questions_table_context",
+                "table_pipeline.evaluation.dump_eval_questions_table_context",
                 "--groups",
                 "TB",
                 "TC",

@@ -4,7 +4,7 @@ from collections import defaultdict
 from pathlib import Path
 from time import perf_counter
 
-from rag_system.table_pipeline.all_hwp_docname_cases import ALL_HWP_DOCNAME_CASES
+from table_pipeline.evaluation.all_hwp_docname_cases import ALL_HWP_DOCNAME_CASES
 from rag_system.qa import load_vectorstore, run_search
 
 

@@ -22,15 +22,23 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from rag_system.config import SETTINGS
 
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from ocr.extract_hwp_artifacts import extract_hwp_artifacts
-from ocr.run_hwp_ocr_pipeline import run_image_ocr
+from table_pipeline.ocr_support.extract_hwp_artifacts import extract_hwp_artifacts
+from table_pipeline.ocr_support.run_hwp_ocr_pipeline import run_image_ocr
+from table_pipeline.table_enrichment import (
+    build_doc_context_blocks,
+    build_table_block,
+    extract_doc_context_hints,
+)
 
 
 warnings.filterwarnings("ignore")
+
+MIN_OCR_LINE_LENGTH = 2
+MIN_IMAGE_BLOCK_LENGTH = 20
 
 SECTION_PATTERNS = [
     re.compile(r"^\s*제?\s*\d+\s*장\b.*$"),
@@ -374,12 +382,17 @@ def normalize_ocr_lines(lines: List[str]) -> List[str]:
     cleaned_lines: List[str] = []
     for line in lines:
         normalized = re.sub(r"\s+", " ", line).strip()
-        if len(normalized) < 2:
+        if len(normalized) < MIN_OCR_LINE_LENGTH:
             continue
         cleaned_lines.append(normalized)
     return cleaned_lines
 
-from rag_system.table_pipeline.table_enrichment import build_doc_context_blocks, build_table_block
+
+def append_labeled_block(blocks: List[str], label: str, body: str) -> None:
+    body = body.strip()
+    if not body:
+        return
+    blocks.append(f"{label}\n{body}")
 
 
 def build_image_blocks(payload: dict) -> List[str]:
@@ -396,7 +409,7 @@ def build_image_blocks(payload: dict) -> List[str]:
             continue
 
         joined_text = "\n".join(cleaned_lines)
-        if len(joined_text) < 20:
+        if len(joined_text) < MIN_IMAGE_BLOCK_LENGTH:
             continue
 
         block_lines = [
@@ -425,16 +438,16 @@ def build_hwp_semantic_text(file_path: Path) -> str:
             blocks.append(table_block)
 
     for block in payload.get("explanatory_blocks", []):
-        body = block.get("text", "").strip()
-        if body:
-            blocks.append(f"[EXPLANATORY_BLOCK]\n{body}")
+        append_labeled_block(blocks, "[EXPLANATORY_BLOCK]", block.get("text", ""))
 
     for header in payload.get("section_header_blocks", []):
         if header.get("linked_child_table_indices"):
             child_labels = ", ".join(str(idx) for idx in header["linked_child_table_indices"])
-            body = header.get("text", "").strip()
-            if body:
-                blocks.append(f"[SECTION_HEADER] children={child_labels}\n{body}")
+            append_labeled_block(
+                blocks,
+                f"[SECTION_HEADER] children={child_labels}",
+                header.get("text", ""),
+            )
 
     blocks.extend(build_image_blocks(payload))
 

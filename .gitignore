@@ -14,5 +14,5 @@ data_list.csv
 apiconn.py
 .uv-cache/
 .hf-cache/
-.ocr/images/
-.ocr/hwp_images/
+ocr/images/
+ocr/hwp_images/

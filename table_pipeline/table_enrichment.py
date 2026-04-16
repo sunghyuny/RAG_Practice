@@ -1,6 +1,8 @@
 import re
 from typing import List, Optional
 
+Pair = tuple[str, str]
+
 
 TABLE_FIELD_HINTS = (
     "요구사항",
@@ -52,13 +54,17 @@ def looks_like_table_label(line: str) -> bool:
 
 
 def join_table_value_lines(lines: List[str]) -> str:
-    normalized = [normalize_table_line(line) for line in lines if normalize_table_line(line)]
+    normalized = []
+    for line in lines:
+        cleaned = normalize_table_line(line)
+        if cleaned:
+            normalized.append(cleaned)
     return " / ".join(normalized)
 
 
-def extract_key_value_pairs(table_text: str) -> List[tuple[str, str]]:
-    lines = [normalize_table_line(line) for line in table_text.splitlines() if normalize_table_line(line)]
-    pairs: List[tuple[str, str]] = []
+def extract_key_value_pairs(table_text: str) -> List[Pair]:
+    lines = extract_table_lines(table_text)
+    pairs: List[Pair] = []
     index = 0
 
     while index < len(lines) - 1:
@@ -88,7 +94,7 @@ def extract_key_value_pairs(table_text: str) -> List[tuple[str, str]]:
 
         index += 1
 
-    deduped: List[tuple[str, str]] = []
+    deduped: List[Pair] = []
     seen = set()
     for label, value in pairs:
         key = (label, value)
@@ -99,13 +105,13 @@ def extract_key_value_pairs(table_text: str) -> List[tuple[str, str]]:
     return deduped
 
 
-def build_table_key_value_lines(table_text: str) -> List[str]:
-    pairs = extract_key_value_pairs(table_text)
+def build_table_key_value_lines(table_text: str, pairs: Optional[List[Pair]] = None) -> List[str]:
+    pairs = pairs or extract_key_value_pairs(table_text)
     return [f"{label}: {value}" for label, value in pairs[:8]]
 
 
-def build_table_row_summary_lines(table_text: str) -> List[str]:
-    pairs = extract_key_value_pairs(table_text)
+def build_table_row_summary_lines(table_text: str, pairs: Optional[List[Pair]] = None) -> List[str]:
+    pairs = pairs or extract_key_value_pairs(table_text)
     summaries: List[str] = []
 
     current: List[str] = []
@@ -125,14 +131,14 @@ def extract_table_lines(table_text: str) -> List[str]:
     return [normalize_table_line(line) for line in table_text.splitlines() if normalize_table_line(line)]
 
 
-def find_pair_value(pairs: List[tuple[str, str]], *keywords: str) -> Optional[str]:
+def find_pair_value(pairs: List[Pair], *keywords: str) -> Optional[str]:
     for label, value in pairs:
         if any(keyword in label for keyword in keywords):
             return value
     return None
 
 
-def detect_table_type(table: dict, table_text: str, pairs: List[tuple[str, str]]) -> str:
+def detect_table_type(table: dict, table_text: str, pairs: List[Pair]) -> str:
     parent_text = normalize_table_line(table.get("linked_parent_text") or "")
     body = f"{parent_text}\n{table_text}"
 
@@ -149,6 +155,14 @@ def detect_table_type(table: dict, table_text: str, pairs: List[tuple[str, str]]
     if any(keyword in body for keyword in ["일정", "기간", "제출", "마감"]):
         return "schedule_table"
     return "general_table"
+
+
+def append_if_value(lines: List[str], label: str, value: Optional[str], max_length: Optional[int] = None) -> None:
+    if not value:
+        return
+    if max_length is not None:
+        value = value[:max_length]
+    lines.append(f"{label}: {value}")
 
 
 DOC_TITLE_STOPWORDS = {
@@ -232,7 +246,7 @@ def summarize_terms(table_text: str, terms: List[str], limit: int = 6) -> str:
     return ", ".join(found)
 
 
-def build_type_template_summary(table_type: str, table_text: str, pairs: List[tuple[str, str]]) -> List[str]:
+def build_type_template_summary(table_type: str, table_text: str, pairs: List[Pair]) -> List[str]:
     lines: List[str] = []
 
     if table_type == "equipment_region":
@@ -240,21 +254,16 @@ def build_type_template_summary(table_type: str, table_text: str, pairs: List[tu
         name_value = find_pair_value(pairs, "요구사항 명칭", "명칭")
         equipment_terms = summarize_terms(table_text, ["CTI", "교환기", "IP녹취", "IP전화기", "게이트웨이", "서버", "SIP", "PSTN"])
         region_terms = summarize_terms(table_text, ["중앙", "서울", "대전", "대구", "광주"])
-        if id_value:
-            lines.append(f"요구사항 ID: {id_value}")
-        if name_value:
-            lines.append(f"요구사항 명칭: {name_value}")
-        if equipment_terms:
-            lines.append(f"장비 목록: {equipment_terms}")
-        if region_terms:
-            lines.append(f"대상 지역: {region_terms}")
+        append_if_value(lines, "요구사항 ID", id_value)
+        append_if_value(lines, "요구사항 명칭", name_value)
+        append_if_value(lines, "장비 목록", equipment_terms)
+        append_if_value(lines, "대상 지역", region_terms)
         return lines
 
     if table_type == "service_status":
         service_terms = summarize_terms(table_text, ["모바일오피스", "업무전용앱", "업무지원 앱", "VPN", "MDM", "메신저", "그룹채팅", "전화걸기"])
         purpose_lines = collect_matching_lines(table_text, ["통합", "이관", "폐지", "사용", "기능"], limit=2)
-        if service_terms:
-            lines.append(f"주요 서비스/앱: {service_terms}")
+        append_if_value(lines, "주요 서비스/앱", service_terms)
         lines.extend(f"현황 요약: {line}" for line in purpose_lines)
         return lines
 
@@ -268,14 +277,10 @@ def build_type_template_summary(table_type: str, table_text: str, pairs: List[tu
         name_value = find_pair_value(pairs, "요구사항 명칭", "명칭")
         user_value = find_pair_value(pairs, "사용자")
         detail_value = find_pair_value(pairs, "세부", "내용", "정의")
-        if id_value:
-            lines.append(f"요구사항 ID: {id_value}")
-        if name_value:
-            lines.append(f"요구사항 명칭: {name_value}")
-        if user_value:
-            lines.append(f"대상 사용자: {user_value}")
-        if detail_value:
-            lines.append(f"핵심 내용: {detail_value[:220]}")
+        append_if_value(lines, "요구사항 ID", id_value)
+        append_if_value(lines, "요구사항 명칭", name_value)
+        append_if_value(lines, "대상 사용자", user_value)
+        append_if_value(lines, "핵심 내용", detail_value, max_length=220)
         return lines
 
     return []
@@ -440,12 +445,12 @@ def build_table_block(table: dict, doc_title: str, hint_map: Optional[dict[str, 
         lines.append("[DOC_FOCUS_SUMMARY]")
         lines.extend(focus_hint_lines)
 
-    key_value_lines = [f"{label}: {value}" for label, value in pairs[:8]]
+    key_value_lines = build_table_key_value_lines(body, pairs)
     if key_value_lines:
         lines.append("[KEY_VALUE_SUMMARY]")
         lines.extend(key_value_lines)
 
-    row_summary_lines = build_table_row_summary_lines(body)
+    row_summary_lines = build_table_row_summary_lines(body, pairs)
     if row_summary_lines:
         lines.append("[ROW_SUMMARY]")
         lines.extend(row_summary_lines)

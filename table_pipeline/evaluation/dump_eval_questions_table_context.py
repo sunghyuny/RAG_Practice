@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from rag_system.table_pipeline.eval_questions_table_runner import DEFAULT_QUESTION_FILE, parse_eval_questions
+from table_pipeline.evaluation.eval_questions_table_runner import DEFAULT_QUESTION_FILE, parse_eval_questions
 from rag_system.qa import load_vectorstore, run_search
 
 
